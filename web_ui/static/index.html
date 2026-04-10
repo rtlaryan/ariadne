@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ariadne Interactive Tester</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+    <div class="app-container">
+        <!-- Header / Controls -->
+        <header class="glass-panel">
+            <div class="header-title">
+                <h1>Ariadne</h1>
+                <p>Interactive Model Testing</p>
+            </div>
+            
+            <div class="controls-row">
+                <div class="control-group">
+                    <label>Model Checkpoint</label>
+                    <div class="select-wrapper">
+                        <select id="model-select">
+                            <option value="">Loading models...</option>
+                        </select>
+                        <button id="load-model-btn" class="btn btn-primary">Load</button>
+                    </div>
+                </div>
+
+                <div class="control-group">
+                    <label>Inference Mode</label>
+                    <select id="inference-mode">
+                        <option value="greedy">Greedy</option>
+                        <option value="beam_search">Beam Search (Gated)</option>
+                    </select>
+                </div>
+
+                <div class="control-group">
+                    <label>Confidence Threshold</label>
+                    <input type="number" id="conf-threshold" min="0.0" max="1.0" step="0.05" value="0.85">
+                </div>
+
+                <div class="control-group">
+                    <label>Top-K (Beam)</label>
+                    <input type="number" id="top-k" min="1" max="10" step="1" value="3">
+                </div>
+                
+                <div class="control-group reset-group">
+                    <button id="reset-btn" class="btn btn-danger">Force Reset</button>
+                </div>
+            </div>
+        </header>
+
+        <!-- Main Layout -->
+        <main class="main-content">
+            <!-- Left: Video Stream -->
+            <section class="video-section glass-panel">
+                <div class="video-header">
+                    <h2>Live View (icalc)</h2>
+                    <span id="connection-status" class="status-badge disconnected">Disconnected</span>
+                </div>
+                <div class="video-container">
+                    <img id="screen-view" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" alt="Waiting for icalc connection...">
+                    <div id="blind-mode-overlay" class="hidden">
+                        <p>Blind mode: no video signal</p>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Right: Goal & Logs -->
+            <section class="interaction-section glass-panel">
+                
+                <!-- Goal Setting -->
+                <div class="goal-box">
+                    <h2>Set Objective</h2>
+                    <div class="input-group">
+                        <input type="text" id="goal-input" placeholder="e.g. sin(45) + 12" autocomplete="off">
+                        <button id="set-goal-btn" class="btn btn-accent">Execute</button>
+                    </div>
+                </div>
+
+                <!-- Action History -->
+                <div class="history-box">
+                     <div class="history-header">
+                         <h3>Action History</h3>
+                         <span id="current-confidence" class="conf-badge"></span>
+                     </div>
+                     <div class="history-tokens" id="action-history">
+                         <!-- Tokens will appear here -->
+                     </div>
+                </div>
+
+                <!-- System Logs -->
+                <div class="logs-box">
+                    <h3>System Logs</h3>
+                    <div class="terminal" id="sys-logs">
+                        <!-- Logs appended here -->
+                    </div>
+                </div>
+
+            </section>
+        </main>
+    </div>
+
+    <script src="script.js"></script>
+</body>
+</html>

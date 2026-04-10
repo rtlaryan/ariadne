@@ -1,0 +1,100 @@
+experiment_name: "exp_256_4_4"
+base_save_dir: "runs"
+overwrite: false
+reset_scheduler: false
+
+# Model Architecture
+embed_dim: 256
+num_layers: 4
+num_heads: 4
+max_len: 196
+block_size: 4096
+use_packing: true
+dropout: 0.1
+
+# Phase 0: Dataset Generation
+data_generation:
+  enabled: false
+  mode: "supervised"           # "supervised", "crawler", or "both"
+  output_dir: "dataset"        # relative to project root (or experiment dir if experiment_specific)
+  experiment_specific: false
+  episodes: 300000
+  workers: 18
+  basic_only: false
+  history_window: -1
+  remote_clients: true
+  timeout_safety_multiplier: 3.0
+  min_depth: 1
+  max_depth: 3
+
+# Phase 1: Pre-training
+pretrain:
+  enabled: true
+  run_name: "pre_train"
+  epochs: 10
+  batch_size: 512
+  lr: 3e-4
+  data_dir: "dataset"          # path to supervised data
+  max_episodes: 75000 
+  # resume_from:              # optional: path to a checkpoint to seed from
+
+# Phase 2: DAgger Loop
+dagger:
+  enabled: true
+  iterations: 10
+
+  generation:
+    episodes_per_iter: 5000
+    workers: 8
+    remote_clients: true
+    history_window: -1
+    max_corrections: 10
+    max_steps_multiplier: 2.0
+    idle_timeout: 120
+    timeout_safety_multiplier: 3.0
+    min_depth: 1
+    max_depth: [3, 4, 5, 6, 7]
+
+  training:
+    epochs: 10
+    batch_size: 1024
+    lr: 1e-4
+    expert_multiplier: 0.25    # ratio of expert episodes per dagger episode
+    decay_factor: 0.8          # probability of keeping data:  factor^age
+
+# Phase 3: Reinforcement Learning
+rl:
+  enabled: false
+  iterations: 5
+  # resume_from:               # optional: seed RL from a previous checkpoint
+
+  rollout:
+    episodes_per_iter: 1000
+    workers: 8
+    remote_clients: true
+    max_steps_multiplier: 2.0
+    idle_timeout: 120
+    timeout_safety_multiplier: 3.0
+    step_bonus: 0.0
+    decode: "greedy"
+    temperature: 1.0
+    min_depth: 1
+    max_depth: 7
+
+  training:
+    lr: 1e-5
+    lr_decay: 0.995             # multiplicative decay applied across RL iterations (iter-level)
+    lr_warmup_steps: 0          # linear warm-up steps within one RL iteration (0 = disabled)
+    lr_min_ratio: 0.05          # cosine floor: final LR = lr * lr_min_ratio
+    gamma: 0.99
+    entropy_bonus: 0.001
+    entropy_decay: 0.995
+    kl_penalty: 0.2
+    kl_decay: 0.99
+    max_grad_norm: 0.5
+    baseline_alpha: 0.99
+    rl_epochs: 1
+    rl_batch_size: 64
+    success_only: true
+    supervised_weight: 0.0
+    min_success_rate: 0.0
