@@ -27,7 +27,8 @@ import uuid
 import torch
 import torch.nn.functional as F
 
-from ariadne.agents.oracle import FUNCTION_KEYS, KEY_DISPLAY, Oracle
+from ariadne.agents.oracle import Oracle
+from ariadne.core.action_sim import apply_key_to_readout
 from ariadne.inference.agent import Agent
 
 
@@ -54,16 +55,7 @@ def _is_clean(state: dict) -> bool:
 
 
 def _simulate(current: str, key: str) -> str:
-    if key in ("m", "Enter", "="):
-        return current
-    if key == "Backspace":
-        return current[:-1] if current else ""
-    if key == "Escape":
-        return ""
-    text = KEY_DISPLAY.get(key, key)
-    if key in FUNCTION_KEYS:
-        text += "("
-    return current + text
+    return apply_key_to_readout(current, key)
 
 
 def _is_valid_prefix(current: str, goal: str) -> bool:

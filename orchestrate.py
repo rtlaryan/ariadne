@@ -19,6 +19,7 @@ import glob
 import json
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -29,8 +30,7 @@ import yaml
 
 HERE       = os.path.dirname(os.path.abspath(__file__))
 # Parent directory that contains the ariadne package.
-# All subprocess invocations add this to PYTHONPATH so that
-# `import ariadne` works regardless of the caller's cwd.
+# This is only for PYTHONPATH so `import ariadne` works in subprocesses.
 PACKAGE_ROOT = os.path.dirname(HERE)
 
 
@@ -68,6 +68,157 @@ def _count_jsonl_lines(directory: str) -> int:
     return count
 
 
+def _count_jsonl_episodes(paths: list[str]) -> int:
+    """Count episode records in JSONL files.
+
+    For step datasets, rows with the same episode_id are grouped together and
+    counted once. For rollout-style JSONL where each line is already one
+    episode, each distinct line contributes one record.
+    """
+    count = 0
+    for path in paths:
+        try:
+            with open(path) as f:
+                cur_eid = object()
+                for raw in f:
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    try:
+                        obj = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    eid = obj.get("episode_id")
+                    if eid is None:
+                        count += 1
+                    elif eid != cur_eid:
+                        count += 1
+                        cur_eid = eid
+        except OSError:
+            pass
+    return count
+
+
+def _timestamp_batches(paths: list[str]) -> dict[str, list[str]]:
+    """Group timestamped JSONL files by trailing numeric timestamp."""
+    batches: dict[str, list[str]] = {}
+    for path in paths:
+        m = re.search(r"_(\d+)\.jsonl$", os.path.basename(path))
+        ts = m.group(1) if m else "unknown"
+        batches.setdefault(ts, []).append(path)
+    return batches
+
+
+def _assert_single_timestamp_batch(paths: list[str], label: str, directory: str) -> None:
+    """Fail fast when a directory contains multiple timestamp batches."""
+    batches = _timestamp_batches(paths)
+    if len(batches) <= 1:
+        return
+    summary = ", ".join(
+        f"{ts}: {len(batch_paths)} files"
+        for ts, batch_paths in sorted(batches.items())
+    )
+    raise RuntimeError(
+        f"{label} found multiple timestamp batches in {directory}: {summary}. "
+        "Remove stale partial files or use overwrite before rerunning."
+    )
+
+
+def _expected_worker_episode_counts(target: int, workers: int) -> list[int]:
+    """Return the target episode allocation for each worker shard."""
+    base = target // workers
+    rem = target % workers
+    return [base + (1 if w < rem else 0) for w in range(workers)]
+
+
+def _collect_worker_episode_progress(
+    files: list[str],
+    mode: str,
+    workers: int,
+    base_port: int,
+) -> tuple[dict[int, int], dict[int, str], str | None]:
+    """Return per-worker completed episodes, file paths, and current timestamp."""
+    progress = {w: 0 for w in range(workers)}
+    paths_by_worker: dict[int, str] = {}
+    if not files:
+        return progress, paths_by_worker, None
+
+    batches = _timestamp_batches(files)
+    timestamps = sorted(batches)
+    ts = timestamps[0] if timestamps else None
+
+    for path in files:
+        m = re.search(rf"dataset_{re.escape(mode)}_(\d+)_(\d+)\.jsonl$", os.path.basename(path))
+        if not m:
+            continue
+        port = int(m.group(1))
+        worker = port - base_port
+        if worker < 0 or worker >= workers:
+            continue
+        if worker in paths_by_worker:
+            raise RuntimeError(
+                f"Data Gen ({mode}) found multiple files for worker {worker} in the active batch."
+            )
+        paths_by_worker[worker] = path
+        progress[worker] = _count_jsonl_episodes([path])
+
+    return progress, paths_by_worker, ts
+
+
+def _summarize_dagger_episodes(directory: str) -> Optional[dict]:
+    """Aggregate episode-level DAgger summaries from *.ndjson sidecar files."""
+    total = success = 0
+    total_steps = total_recovery_steps = 0
+
+    for path in glob.glob(os.path.join(directory, "**", "dagger_episodes_*.ndjson"), recursive=True):
+        try:
+            with open(path, "r") as f:
+                for raw in f:
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    try:
+                        ep = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    total += 1
+                    success += int(bool(ep.get("success", False)))
+                    total_steps += int(ep.get("num_steps", 0))
+                    total_recovery_steps += int(ep.get("recovery_steps", 0))
+        except OSError:
+            pass
+
+    if total == 0:
+        return None
+
+    return {
+        "episodes": total,
+        "successes": success,
+        "success_rate": success / float(total),
+        "avg_steps": total_steps / float(total),
+        "avg_recovery_steps": total_recovery_steps / float(total),
+    }
+
+
+def _resolve_from_project_root(path: str) -> str:
+    """Resolve a config path relative to the ariadne top-level directory."""
+    if os.path.isabs(path):
+        return path
+    return os.path.abspath(os.path.join(HERE, path))
+
+
+def _resolve_from_package_dir(path: str) -> str:
+    """Resolve a config path relative to the ariadne package directory."""
+    if os.path.isabs(path):
+        return path
+    return os.path.abspath(os.path.join(HERE, path))
+
+
+def _needs_seed_model(cfg: dict) -> bool:
+    """Return True when later phases require a checkpoint from pretraining."""
+    return bool(cfg.get("dagger", {}).get("enabled", False) or cfg.get("rl", {}).get("enabled", False))
+
+
 # ---------------------------------------------------------------------------
 # Parallel worker runner — used by phases 0, 2 (gen), and 3 (rollout)
 # ---------------------------------------------------------------------------
@@ -82,6 +233,8 @@ def _run_workers(
     idle_timeout:      int                 = 300,
     timeout_safety:    float               = 3.0,
     agent_cwd:         Optional[str]       = None,
+    initial_progress:  Optional[dict[int, int]] = None,
+    base_completed:    int                 = 0,
 ) -> int:
     """Start agent subprocess workers and optionally a client manager.
 
@@ -123,10 +276,17 @@ def _run_workers(
         print(f"[Orchestrate] Remote clients mode — waiting for external connections.")
 
     progress     = {i: 0 for i in range(n_workers)}
+    offsets      = {i: 0 for i in range(n_workers)}
+    if initial_progress:
+        for i, value in initial_progress.items():
+            if i in offsets:
+                offsets[i] = value
     start_time   = time.time()
     measured_rate = None
     timeout      = None
-    DIAG         = min(10 * n_workers, max(1, target_episodes // 4), 50)
+    initial_offset_total = sum(initial_progress.values()) if initial_progress else 0
+    remaining_target = max(0, target_episodes - base_completed - initial_offset_total)
+    DIAG         = min(10 * n_workers, max(1, remaining_target // 4), 50) if remaining_target > 0 else 1
 
     try:
         while True:
@@ -136,27 +296,32 @@ def _run_workers(
                     wid, line = out_queue.get_nowait()
                     if line.startswith("STATUS:EPISODE_COMPLETE:"):
                         try:
-                            progress[wid] = int(line.split(":")[2])
+                            reported = int(line.split(":")[2])
+                            progress[wid] = max(0, reported - offsets.get(wid, 0))
                         except (IndexError, ValueError):
                             pass
                     elif line.startswith("STATUS:EXIT:"):
                         parts = line.split(":")
                         try:
-                            progress[wid] = int(parts[3]) if len(parts) >= 4 else progress[wid]
+                            if len(parts) >= 4:
+                                reported = int(parts[3])
+                                progress[wid] = max(0, reported - offsets.get(wid, 0))
                         except ValueError:
                             pass
             except queue.Empty:
                 pass
 
-            total     = sum(progress.values())
+            run_total  = sum(progress.values())
+            offset_total = sum(offsets.values())
+            total      = base_completed + offset_total + run_total
             elapsed   = time.time() - start_time
-            rate      = total / elapsed if elapsed > 0 else 0
+            rate      = run_total / elapsed if elapsed > 0 else 0
             alive     = [p for p in server_procs if p.poll() is None]
 
-            if total >= DIAG and measured_rate is None:
+            if run_total >= DIAG and elapsed >= 5.0 and measured_rate is None:
                 measured_rate = rate
                 if measured_rate > 0:
-                    timeout = (target_episodes / measured_rate) * timeout_safety
+                    timeout = (remaining_target / measured_rate) * timeout_safety
                     print(
                         f"\n[Orchestrate] Diagnostic: {measured_rate:.1f} ep/s → "
                         f"timeout {timeout:.0f}s"
@@ -187,7 +352,7 @@ def _run_workers(
             if p.poll() is None:
                 p.terminate()
 
-    return sum(progress.values())
+    return base_completed + sum(offsets.values()) + sum(progress.values())
 
 
 # ---------------------------------------------------------------------------
@@ -205,44 +370,93 @@ def phase_datagen(cfg: dict, exp_dir: str) -> Optional[str]:
     if dg.get("experiment_specific", True):
         data_dir = os.path.join(exp_dir, dg.get("output_dir", "dataset"))
     else:
-        data_dir = dg.get("output_dir", "dataset")
-        if not os.path.isabs(data_dir):
-            data_dir = os.path.join(os.path.dirname(exp_dir), data_dir)
+        data_dir = _resolve_from_project_root(dg.get("output_dir", "dataset"))
+
+    mode = dg.get("mode", "supervised")
+    if mode == "both":
+        relevant_files = sorted(glob.glob(os.path.join(data_dir, "dataset_*.jsonl")))
+        for submode in ("supervised", "crawler"):
+            _assert_single_timestamp_batch(
+                sorted(glob.glob(os.path.join(data_dir, f"dataset_{submode}_*.jsonl"))),
+                label=f"Data Gen ({submode})",
+                directory=data_dir,
+            )
+    else:
+        relevant_files = sorted(glob.glob(os.path.join(data_dir, f"dataset_{mode}_*.jsonl")))
+        _assert_single_timestamp_batch(
+            relevant_files,
+            label=f"Data Gen ({mode})",
+            directory=data_dir,
+        )
 
     target   = dg.get("episodes", 10000)
     workers  = dg.get("workers",   4)
-    existing = _count_jsonl_lines(data_dir)
+    existing = _count_jsonl_episodes(relevant_files)
 
     if existing >= target:
-        print(f"[Orchestrate] Data already exists ({existing} steps). Skipping generation.")
+        print(f"[Orchestrate] Data already exists ({existing} episodes). Skipping generation.")
         return data_dir
 
-    mode             = dg.get("mode",           "supervised")
     basic_only       = dg.get("basic_only",     False)
     history_window   = dg.get("history_window", -1)
     remote_clients   = dg.get("remote_clients", False)
     min_depth        = dg.get("min_depth",      1)
     max_depth        = dg.get("max_depth",      3)
     base_port        = 9000
-    ep_per_worker    = target // workers
+    worker_targets   = _expected_worker_episode_counts(target, workers)
+
+    if mode == "both":
+        raise RuntimeError("Resumable data generation currently supports 'supervised' or 'crawler' mode, not 'both'.")
+
+    worker_progress, worker_paths, active_ts = _collect_worker_episode_progress(
+        relevant_files, mode, workers, base_port
+    )
 
     cmds = []
+    initial_progress: dict[int, int] = {}
+    base_completed = 0
     for w in range(workers):
-        ep = ep_per_worker + (1 if w < target % workers else 0)
+        target_ep = worker_targets[w]
+        completed_ep = min(worker_progress.get(w, 0), target_ep)
+        if completed_ep >= target_ep:
+            base_completed += completed_ep
+            continue
+
+        initial_progress[len(cmds)] = completed_ep
         cmd = [
             sys.executable, "-m", "ariadne.agents.gen_agent",
             "--mode",           mode,
-            "--episodes",       str(ep),
+            "--episodes",       str(target_ep),
             "--output-dir",     data_dir,
             "--port",           str(base_port + w),
             "--shard-id",       str(w),
             "--total-shards",   str(workers),
+            "--resume-episodes", str(completed_ep),
             "--history-window", str(history_window),
         ]
+        output_file = worker_paths.get(w)
+        if output_file:
+            cmd.extend(["--output-file", output_file])
+        elif active_ts:
+            output_file = os.path.join(
+                data_dir,
+                f"dataset_{mode}_{base_port + w}_{active_ts}.jsonl",
+            )
+            cmd.extend(["--output-file", output_file])
         if basic_only:
             cmd.append("--basic-only")
         cmd.extend(["--min-depth", str(min_depth), "--max-depth", str(max_depth)])
         cmds.append(cmd)
+
+    if not cmds:
+        print(f"[Orchestrate] Data already exists ({existing} episodes). Skipping generation.")
+        return data_dir
+
+    if existing > 0:
+        print(
+            f"[Orchestrate] Resuming data generation from {existing}/{target} episodes "
+            f"across {len(cmds)}/{workers} workers."
+        )
 
     client_cmd = None
     client_cwd = None
@@ -264,6 +478,8 @@ def phase_datagen(cfg: dict, exp_dir: str) -> Optional[str]:
         idle_timeout    = 300,
         timeout_safety  = dg.get("timeout_safety_multiplier", 3.0),
         agent_cwd       = None,
+        initial_progress= initial_progress,
+        base_completed  = base_completed,
     )
     return data_dir
 
@@ -278,7 +494,23 @@ def phase_pretrain(cfg: dict, exp_dir: str) -> str:
     if not pt.get("enabled", True):
         print("[Orchestrate] Pre-training disabled — skipping.")
         ckpt = _find_checkpoint(os.path.join(exp_dir, pt.get("run_name", "pre_train")))
-        return ckpt or ""
+        if ckpt:
+            return ckpt
+        resume_from = pt.get("resume_from")
+        if resume_from:
+            resolved = _resolve_from_package_dir(resume_from)
+            if os.path.isfile(resolved):
+                print(f"[Orchestrate] Using pretrain.resume_from: {resolved}")
+                return resolved
+            raise RuntimeError(
+                f"Pre-training is disabled, but resume_from checkpoint was not found: {resolved}"
+            )
+        if _needs_seed_model(cfg):
+            raise RuntimeError(
+                "Pre-training is disabled and no seed checkpoint is available. "
+                "Set pretrain.resume_from or enable pre-training."
+            )
+        return ""
 
     run_name = pt.get("run_name", "pre_train")
     run_dir  = os.path.join(exp_dir, run_name)
@@ -333,6 +565,11 @@ def phase_dagger(cfg: dict, exp_dir: str, start_model: str) -> str:
     if not dagger_cfg.get("enabled", False):
         print("[Orchestrate] DAgger disabled — skipping.")
         return start_model
+    if not start_model:
+        raise RuntimeError(
+            "DAgger requires a seed model checkpoint, but none was provided. "
+            "Enable pre-training or set pretrain.resume_from."
+        )
 
     iterations     = dagger_cfg.get("iterations", 5)
     gen_cfg        = dagger_cfg.get("generation", {})
@@ -383,6 +620,8 @@ def phase_dagger(cfg: dict, exp_dir: str, start_model: str) -> str:
                     "--history-window", str(gen_cfg.get("history_window", -1)),
                     "--max-corrections", str(gen_cfg.get("max_corrections", 10)),
                     "--max-steps-multiplier", str(gen_cfg.get("max_steps_multiplier", 2.0)),
+                    "--allow-recovery-mistakes", str(int(bool(gen_cfg.get("allow_recovery_mistakes", True)))),
+                    "--recoverable-mistake-rate", str(gen_cfg.get("recoverable_mistake_rate", 0.5)),
                     "--idle-timeout",   str(gen_cfg.get("idle_timeout", 120)),
                     "--min-depth",      str(cur_min_depth),
                     "--max-depth",      str(cur_max_depth),
@@ -406,6 +645,14 @@ def phase_dagger(cfg: dict, exp_dir: str, start_model: str) -> str:
                 client_cwd      = client_cwd,
                 idle_timeout    = gen_cfg.get("idle_timeout", 120),
                 timeout_safety  = gen_cfg.get("timeout_safety_multiplier", 3.0),
+            )
+        summary = _summarize_dagger_episodes(data_out)
+        if summary:
+            print(
+                f"[Orchestrate] DAgger iter {i+1} success "
+                f"{summary['successes']}/{summary['episodes']} ({summary['success_rate']:.1%}) "
+                f"| avg_steps={summary['avg_steps']:.2f} "
+                f"| avg_recovery_steps={summary['avg_recovery_steps']:.2f}"
             )
 
         # Training
@@ -466,6 +713,11 @@ def phase_rl(cfg: dict, exp_dir: str, start_model: str) -> str:
     if not rl_cfg.get("enabled", False):
         print("[Orchestrate] RL disabled — skipping.")
         return start_model
+    if not start_model:
+        raise RuntimeError(
+            "RL requires a seed model checkpoint, but none was provided. "
+            "Enable an earlier phase or set the relevant resume_from checkpoint."
+        )
 
     iterations     = rl_cfg.get("iterations", 100)
     rollout_cfg    = rl_cfg.get("rollout",   {})

@@ -24,7 +24,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm.auto import tqdm
 
-from ariadne.core.dataset import SoftwareTrajectoryDataset, _collect_jsonl
+from ariadne.core.dataset import SoftwareTrajectoryDataset, _collect_jsonl, _iter_episodes
 from ariadne.core.model import (
     AgentTransformer,
     PackedCollator,
@@ -60,6 +60,98 @@ def _resize_vocab(model: AgentTransformer, new_vocab_size: int) -> None:
     model.vocab_size  = new_vocab_size
 
 
+def _load_dagger_collection_metrics(data_dirs: list[str]) -> Optional[dict]:
+    """Load aggregate episode metrics for generated DAgger data when available."""
+    summary_files: list[str] = []
+    for root in data_dirs:
+        if os.path.isdir(root):
+            summary_files.extend(
+                glob.glob(os.path.join(root, "**", "dagger_episodes_*.ndjson"), recursive=True)
+            )
+
+    total = success = 0
+    total_steps = total_corrections = 0
+    total_policy_mistakes = total_override_steps = total_recovery_steps = 0
+
+    for path in summary_files:
+        try:
+            with open(path, "r") as f:
+                for raw in f:
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    try:
+                        ep = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    total += 1
+                    success += int(bool(ep.get("success", False)))
+                    total_steps += int(ep.get("num_steps", 0))
+                    total_corrections += int(ep.get("corrections", 0))
+                    total_policy_mistakes += int(ep.get("policy_mistakes", 0))
+                    total_override_steps += int(ep.get("override_steps", 0))
+                    total_recovery_steps += int(ep.get("recovery_steps", 0))
+        except OSError:
+            continue
+
+    if total > 0:
+        denom = float(total)
+        return {
+            "source": "episode_summaries",
+            "episodes": total,
+            "successes": success,
+            "success_rate": success / denom,
+            "avg_steps": total_steps / denom,
+            "avg_corrections": total_corrections / denom,
+            "avg_policy_mistakes": total_policy_mistakes / denom,
+            "avg_override_steps": total_override_steps / denom,
+            "avg_recovery_steps": total_recovery_steps / denom,
+        }
+
+    files = [p for p in _collect_jsonl(data_dirs) if "dagger" in os.path.basename(p)]
+    if not files:
+        return None
+
+    inferred_total = inferred_success = 0
+    for episode in _iter_episodes(files):
+        if not episode:
+            continue
+        inferred_total += 1
+        action = episode[-1].get("action", {})
+        key = action.get("key") if isinstance(action, dict) else str(action)
+        if key == "Enter":
+            inferred_success += 1
+
+    if inferred_total == 0:
+        return None
+
+    return {
+        "source": "step_labels_inferred",
+        "episodes": inferred_total,
+        "successes": inferred_success,
+        "success_rate": inferred_success / float(inferred_total),
+    }
+
+
+def _batch_episode_success_stats(batch) -> tuple[float, int]:
+    """Return (success_sum, episode_count) for the current training batch."""
+    if isinstance(batch, dict):
+        values = batch.get("episode_success")
+        if values is None:
+            return 0.0, 0
+        if torch.is_tensor(values):
+            if values.numel() == 0:
+                return 0.0, 0
+            return values.float().sum().item(), int(values.numel())
+        values = list(values)
+        return sum(float(v) for v in values), len(values)
+
+    values = getattr(batch, "episode_successes", None)
+    if not values:
+        return 0.0, 0
+    return sum(float(v) for v in values), len(values)
+
+
 # ---------------------------------------------------------------------------
 # Trainer
 # ---------------------------------------------------------------------------
@@ -74,6 +166,7 @@ class Trainer:
       epochs       (int)       – number of training epochs
       batch_size   (int)
       lr           (float)
+      lr_decay     (float)     – multiplicative LR decay across DAgger iterations
       resume_from  (str|None)  – path to a previous checkpoint to load weights from
       reset_scheduler (bool)   – restart LR scheduler when resuming
 
@@ -99,6 +192,7 @@ class Trainer:
         self.epochs      = int(train_cfg.get("epochs", 10))
         self.batch_size  = int(train_cfg.get("batch_size", 512))
         self.lr          = float(train_cfg.get("lr", 3e-4))
+        self.lr_decay    = float(train_cfg.get("lr_decay", 1.0))
         # steps_per_epoch is used to size the LR scheduler for IterableDatasets
         # (which have no len()).  If not set, defaults to 1000.
         self.steps_per_epoch = int(train_cfg.get("steps_per_epoch", 1000))
@@ -110,6 +204,7 @@ class Trainer:
         self.decay_factor      = float(train_cfg.get("decay_factor", 1.0))
         self.current_iteration = int(train_cfg.get("current_iteration", 1))
         self.max_episodes      = train_cfg.get("max_episodes")
+        self.effective_lr      = self._effective_base_lr()
 
         # Architecture
         self.embed_dim   = cfg.get("embed_dim",   256)
@@ -137,6 +232,12 @@ class Trainer:
 
     def _tokenizer_path(self) -> str:
         return os.path.join(self.run_dir, "tokenizer.json")
+
+    def _effective_base_lr(self) -> float:
+        if not self.use_dagger:
+            return self.lr
+        decay_step = max(0, self.current_iteration - 1)
+        return self.lr * (self.lr_decay ** decay_step)
 
     def _setup_tokenizer(self) -> None:
         tok_path = self._tokenizer_path()
@@ -214,11 +315,13 @@ class Trainer:
 
     def _setup_optimizer(self) -> None:
         self.optimizer = torch.optim.AdamW(
-            self.model.parameters(), lr=self.lr, weight_decay=0.01
+            self.model.parameters(), lr=self.effective_lr, weight_decay=0.01
         )
         if self._optimizer_state and not self.reset_sched:
             try:
                 self.optimizer.load_state_dict(self._optimizer_state)
+                for pg in self.optimizer.param_groups:
+                    pg["lr"] = self.effective_lr
             except Exception as e:
                 print(f"[Trainer] Could not restore optimizer state: {e}")
 
@@ -290,23 +393,59 @@ class Trainer:
             # Cosine from 1 → eta_ratio
             return eta_ratio + (1.0 - eta_ratio) * 0.5 * (1.0 + math.cos(math.pi * progress))
 
-        # Reset optimizer LR to self.lr so the lambda multipliers start from
-        # the right base (important when resuming from a pretrain checkpoint).
+        # Reset optimizer LR to the effective base LR so the lambda multipliers
+        # start from the right value when DAgger iteration-level decay is used.
         for pg in self.optimizer.param_groups:
-            pg["lr"] = self.lr
+            pg["lr"] = self.effective_lr
 
         scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=_lr_lambda)
+
+        print(
+            f"[Trainer] Base LR: {self.effective_lr:.2e}"
+            + (
+                f" (decayed from {self.lr:.2e} for DAgger iter {self.current_iteration})"
+                if self.use_dagger and self.current_iteration > 1
+                else ""
+            )
+        )
 
         writer    = SummaryWriter(self.log_dir)
         global_step = 0
         best_loss   = float("inf")
+        dagger_metrics = _load_dagger_collection_metrics(self.data_dirs) if self.use_dagger else None
+        if dagger_metrics:
+            msg = (
+                f"[Trainer] DAgger collection success {dagger_metrics['successes']}/"
+                f"{dagger_metrics['episodes']} ({dagger_metrics['success_rate']:.1%}) "
+                f"[source={dagger_metrics['source']}]"
+            )
+            if "avg_steps" in dagger_metrics:
+                msg += (
+                    f" | avg_steps={dagger_metrics['avg_steps']:.2f}"
+                    f" avg_recovery_steps={dagger_metrics['avg_recovery_steps']:.2f}"
+                )
+            print(msg)
+            writer.add_scalar("DAgger/collection_success_rate", dagger_metrics["success_rate"], 0)
+            writer.add_scalar("DAgger/collection_episodes", dagger_metrics["episodes"], 0)
+            if "avg_steps" in dagger_metrics:
+                writer.add_scalar("DAgger/collection_avg_steps", dagger_metrics["avg_steps"], 0)
+                writer.add_scalar("DAgger/collection_avg_corrections", dagger_metrics["avg_corrections"], 0)
+                writer.add_scalar("DAgger/collection_avg_policy_mistakes", dagger_metrics["avg_policy_mistakes"], 0)
+                writer.add_scalar("DAgger/collection_avg_override_steps", dagger_metrics["avg_override_steps"], 0)
+                writer.add_scalar("DAgger/collection_avg_recovery_steps", dagger_metrics["avg_recovery_steps"], 0)
 
         for epoch in range(self._start_epoch, self._start_epoch + self.epochs):
             self.model.train()
-            epoch_loss = epoch_acc = epoch_n = 0
+            epoch_loss = epoch_acc = epoch_episode_success = epoch_n = 0
+            epoch_episode_count = 0
 
             pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{self._start_epoch + self.epochs} [{self.run_name}]")
             for batch in pbar:
+                batch_episode_success_sum, batch_episode_count = _batch_episode_success_stats(batch)
+                batch_episode_success = (
+                    batch_episode_success_sum / batch_episode_count
+                    if batch_episode_count > 0 else 0.0
+                )
                 # Handle packed vs. standard batch
                 if self.use_packing:
                     input_ids = batch.input_ids.to(self.device, non_blocking=True)
@@ -348,13 +487,22 @@ class Trainer:
                 l = loss.item()
                 epoch_loss += l
                 epoch_acc  += acc
+                epoch_episode_success += batch_episode_success_sum
+                epoch_episode_count += batch_episode_count
                 epoch_n    += 1
                 global_step += 1
 
                 writer.add_scalar("Loss/train_step", l, global_step)
                 writer.add_scalar("Acc/train_step",  acc, global_step)
+                writer.add_scalar("Success/episode_step", batch_episode_success, global_step)
 
-                pbar.set_postfix({"loss": f"{l:.4f}", "acc": f"{acc:.4f}"})
+                pbar.set_postfix(
+                    {
+                        "loss": f"{l:.4f}",
+                        "acc": f"{acc:.4f}",
+                        "ep_succ": f"{batch_episode_success:.4f}",
+                    }
+                )
 
                 # Live control.json override
                 ctrl = os.path.join(self.run_dir, "control.json")
@@ -371,14 +519,20 @@ class Trainer:
 
             avg_loss = epoch_loss / max(1, epoch_n)
             avg_acc  = epoch_acc  / max(1, epoch_n)
+            avg_episode_success = epoch_episode_success / max(1, epoch_episode_count)
             writer.add_scalar("Loss/train_epoch", avg_loss, epoch)
             writer.add_scalar("Acc/train_epoch",  avg_acc,  epoch)
+            writer.add_scalar("Success/episode_epoch", avg_episode_success, epoch)
 
             # Advance the epoch-level LR scheduler
             scheduler.step()
             writer.add_scalar("Loss/learning_rate", self.optimizer.param_groups[0]["lr"], epoch)
 
-            print(f"[Trainer] Epoch {epoch+1} | Loss {avg_loss:.4f} | Acc {avg_acc:.4f} | LR {self.optimizer.param_groups[0]['lr']:.2e}")
+            print(
+                f"[Trainer] Epoch {epoch+1} | Loss {avg_loss:.4f} | Acc {avg_acc:.4f} "
+                f"| EpisodeSuccess {avg_episode_success:.4f} "
+                f"| LR {self.optimizer.param_groups[0]['lr']:.2e}"
+            )
 
             self._save(epoch + 1, "latest")
             if avg_loss < best_loss:

@@ -24,7 +24,8 @@ import uuid
 
 import torch
 
-from ariadne.agents.oracle import FUNCTION_KEYS, KEY_DISPLAY, Oracle
+from ariadne.agents.oracle import Oracle
+from ariadne.core.action_sim import apply_key_to_readout, is_recoverable_by_single_backspace
 from ariadne.inference.agent import Agent
 
 
@@ -40,25 +41,12 @@ def _is_clean(state: dict) -> bool:
     return not state.get("history") and _normalize_readout(state.get("readout", "")) == ""
 
 
-def _simulate_key(current: str, key: str) -> str:
-    if key in ("m", "Enter", "="):
-        return current
-    if key == "Backspace":
-        return current[:-1] if current else ""
-    if key == "Escape":
-        return ""
-    text = KEY_DISPLAY.get(key, key)
-    if key in FUNCTION_KEYS:
-        text += "("
-    return current + text
-
-
 def _precompute_trajectory(plan: list[str]) -> list[dict]:
     """Return [{expected_history, expert_action}, …] for *plan*."""
     traj, hist = [], ""
     for key in plan:
         traj.append({"expected_history": hist, "expert_action": key})
-        hist = _simulate_key(hist, key)
+        hist = apply_key_to_readout(hist, key)
     return traj
 
 
@@ -79,6 +67,8 @@ class DAggerAgent:
         history_window:    int   = -1,
         max_corrections:   int   = 10,
         max_steps_mult:    float = 2.0,
+        allow_recovery_mistakes: bool = True,
+        recoverable_mistake_rate: float = 0.5,
         idle_timeout:      int   = 120,
         min_depth:         int   = 1,
         max_depth:         int   = 3,
@@ -91,6 +81,8 @@ class DAggerAgent:
         self.history_window  = history_window
         self.max_corrections = max_corrections
         self.max_steps_mult  = max_steps_mult
+        self.allow_recovery_mistakes = allow_recovery_mistakes
+        self.recoverable_mistake_rate = max(0.0, min(1.0, recoverable_mistake_rate))
         self.idle_timeout    = idle_timeout
         self.min_depth       = min_depth
         self.max_depth       = max_depth
@@ -106,13 +98,19 @@ class DAggerAgent:
         self.corrections     = 0
         self.trajectory_step = 0
         self.completed       = 0
+        self.successful      = 0
         self.pending_reset   = False
         self.last_req_time   = time.time()
+        self.episode_policy_mistakes = 0
+        self.episode_override_steps  = 0
+        self.episode_recovery_steps  = 0
 
         self._write_lock = threading.Lock()
         self._write_buf: list[str] = []
+        self._episode_buf: list[str] = []
         self._FLUSH_SIZE = 50
         self._dataset_file = None
+        self._episode_file = None
 
     # ------------------------------------------------------------------
     # Episode management
@@ -129,11 +127,26 @@ class DAggerAgent:
         self.episode_actions = []
         self.corrections     = 0
         self.trajectory_step = 0
+        self.episode_policy_mistakes = 0
+        self.episode_override_steps  = 0
+        self.episode_recovery_steps  = 0
 
-    def _finish(self) -> None:
+    def _finish(self, success: bool, reason: str, task: str) -> None:
+        self._write_episode_summary(task, success, reason)
         self.current_task  = None
         self.pending_reset = True
         self.completed    += 1
+        if success:
+            self.successful += 1
+        rate = self.successful / self.completed if self.completed else 0.0
+        status = "✓" if success else "✗"
+        print(
+            f"Episode {self.completed} [{status}] {task} "
+            f"(steps={len(self.episode_actions)}, corrections={self.corrections}, "
+            f"recovery_steps={self.episode_recovery_steps}, success_rate={rate:.1%}, "
+            f"reason={reason})",
+            flush=True,
+        )
         print(f"STATUS:EPISODE_COMPLETE:{self.completed}", flush=True)
 
     # ------------------------------------------------------------------
@@ -143,20 +156,17 @@ class DAggerAgent:
     def handle_step(self, state: dict) -> dict:
         self.last_req_time = time.time()
         action   = {}
-        is_reset = False
 
         if self.pending_reset:
             self.agent.reset_history()
             self.episode_actions = []
             action       = {"type": "keypress", "key": "Escape"}
-            is_reset     = True
             self.pending_reset = False
             return action
 
         if not self.current_task:
             if not _is_clean(state):
                 action   = {"type": "keypress", "key": "Escape"}
-                is_reset = True
                 return action
             self._new_episode(state)
 
@@ -198,49 +208,63 @@ class DAggerAgent:
         # --- Decision ---
         deviates = model_key != expert_action
         screen_diverged = not matches
-
-        # Override with expert if needed; track corrections
         final_key = model_key
-        if deviates or screen_diverged:
+
+        can_execute_recoverable_mistake = (
+            self.allow_recovery_mistakes
+            and deviates
+            and not screen_diverged
+            and random.random() < self.recoverable_mistake_rate
+            and is_recoverable_by_single_backspace(current_expr, model_key)
+        )
+        if (deviates or screen_diverged) and not can_execute_recoverable_mistake and model_key != expert_action:
             final_key = expert_action
+
+        if deviates:
+            self.episode_policy_mistakes += 1
+        if screen_diverged:
+            self.episode_recovery_steps += 1
+        if final_key != model_key:
+            self.episode_override_steps += 1
+        if deviates or screen_diverged:
             self.corrections += 1
-            if self.corrections > self.max_corrections:
-                print(f"[DAggerAgent] Max corrections exceeded — aborting.")
-                self._finish()
-                final_key = "Escape"
+
+        finish_success = False
+        finish_reason = None
+        if self.corrections > self.max_corrections:
+            print(f"[DAggerAgent] Max corrections exceeded — aborting.")
+            finish_reason = "max_corrections"
+            final_key = "Escape"
 
         # Check max steps
-        if len(self.episode_actions) > len(plan) * self.max_steps_mult:
+        if finish_reason is None and len(self.episode_actions) > len(plan) * self.max_steps_mult:
             print(f"[DAggerAgent] Max steps exceeded — aborting.")
-            self._finish()
+            finish_reason = "max_steps"
             final_key = "Escape"
 
         # Check completion
-        if expert_action == "Enter" and final_key == "Enter":
-            self._finish()
+        if finish_reason is None and expert_action == "Enter" and final_key == "Enter":
+            finish_success = True
+            finish_reason = "completed"
 
         action = {"type": "keypress", "key": final_key}
 
         # --- Log ---
         state["action_history"] = self.episode_actions[:]
-        divergence = "action" if deviates else ("screen" if screen_diverged else "none")
         entry = {
-            "episode_id":       self.episode_id,
-            "timestamp":        time.time(),
-            "mode":             "dagger",
-            "task":             expr,
-            "state":            state,
-            "action":           {"type": "keypress", "key": expert_action},  # EXPERT label
-            "model_prediction": model_key,
-            "divergence_reason": divergence,
-            "step_index":       len(self.episode_actions),
-            "action_history":   self.episode_actions[:],
+            "episode_id": self.episode_id,
+            "mode":       "dagger",
+            "task":       expr,
+            "state":      state,
+            "action":     {"type": "keypress", "key": expert_action},
         }
         self._write(entry)
 
         # Update histories
         self.agent.record_action(final_key)
         self.episode_actions.append(final_key)
+        if finish_reason is not None:
+            self._finish(finish_success, finish_reason, expr)
 
         return action
 
@@ -251,11 +275,33 @@ class DAggerAgent:
                 if len(self._write_buf) >= self._FLUSH_SIZE:
                     self._flush()
 
+    def _write_episode_summary(self, task: str, success: bool, reason: str) -> None:
+        entry = {
+            "episode_id":         self.episode_id,
+            "task":               task,
+            "success":            success,
+            "termination_reason": reason,
+            "num_steps":          len(self.episode_actions),
+            "corrections":        self.corrections,
+            "policy_mistakes":    self.episode_policy_mistakes,
+            "override_steps":     self.episode_override_steps,
+            "recovery_steps":     self.episode_recovery_steps,
+        }
+        with self._write_lock:
+            if self._episode_file:
+                self._episode_buf.append(json.dumps(entry) + "\n")
+                if len(self._episode_buf) >= self._FLUSH_SIZE:
+                    self._flush()
+
     def _flush(self) -> None:
         if self._dataset_file and self._write_buf:
             self._dataset_file.writelines(self._write_buf)
             self._dataset_file.flush()
             self._write_buf.clear()
+        if self._episode_file and self._episode_buf:
+            self._episode_file.writelines(self._episode_buf)
+            self._episode_file.flush()
+            self._episode_buf.clear()
 
     # ------------------------------------------------------------------
     # Server
@@ -263,8 +309,11 @@ class DAggerAgent:
 
     def run(self) -> None:
         os.makedirs(self.output_dir, exist_ok=True)
-        fname = os.path.join(self.output_dir, f"dagger_{self.port}_{int(time.time())}.jsonl")
+        ts = int(time.time())
+        fname = os.path.join(self.output_dir, f"dagger_{self.port}_{ts}.jsonl")
+        episode_fname = os.path.join(self.output_dir, f"dagger_episodes_{self.port}_{ts}.ndjson")
         self._dataset_file = open(fname, "w")
+        self._episode_file = open(episode_fname, "w")
 
         time.sleep(random.uniform(1.0, 5.0))  # startup jitter
 
@@ -320,6 +369,7 @@ class DAggerAgent:
             with self._write_lock: self._flush()
             server.server_close()
             self._dataset_file.close()
+            self._episode_file.close()
 
 
 def main():
@@ -334,6 +384,8 @@ def main():
     p.add_argument("--episodes",          type=int,   default=1000)
     p.add_argument("--max-corrections",   type=int,   default=10)
     p.add_argument("--max-steps-multiplier", type=float, default=2.0)
+    p.add_argument("--allow-recovery-mistakes", type=int, default=1)
+    p.add_argument("--recoverable-mistake-rate", type=float, default=0.5)
     p.add_argument("--idle-timeout",      type=int,   default=120)
     p.add_argument("--min-depth",         type=int,   default=1)
     p.add_argument("--max-depth",         type=int,   default=3)
@@ -350,6 +402,8 @@ def main():
         history_window  = args.history_window,
         max_corrections = args.max_corrections,
         max_steps_mult  = args.max_steps_multiplier,
+        allow_recovery_mistakes = bool(args.allow_recovery_mistakes),
+        recoverable_mistake_rate = args.recoverable_mistake_rate,
         idle_timeout    = args.idle_timeout,
         min_depth       = args.min_depth,
         max_depth       = args.max_depth,

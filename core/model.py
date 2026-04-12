@@ -259,6 +259,7 @@ class PackedBatch:
     attn_mask:      Optional[torch.Tensor]    # [B, T, T] bool  (True=allow)
     position_ids:   Optional[torch.Tensor]    # [B, T]
     sources:        Optional[List[int]]       # source ids per sequence (pre-pack)
+    episode_successes: Optional[List[float]]  # success flags per sequence (pre-pack)
 
 
 def pack_to_blocks(
@@ -270,6 +271,7 @@ def pack_to_blocks(
     drop_last:        bool = True,
     return_attn_mask: bool = False,
     sources:          Optional[List[int]] = None,
+    episode_successes: Optional[List[float]] = None,
 ) -> PackedBatch:
     """Pack variable-length sequences into fixed-size blocks.
 
@@ -303,7 +305,7 @@ def pack_to_blocks(
         empty_mask = torch.zeros((1, block_size), dtype=torch.bool)
         attn = torch.zeros((1, block_size, block_size), dtype=torch.bool) if return_attn_mask else None
         p_ids = torch.zeros((1, block_size), dtype=torch.long)
-        return PackedBatch(empty_ids, empty_lab, empty_mask, attn, p_ids, sources)
+        return PackedBatch(empty_ids, empty_lab, empty_mask, attn, p_ids, sources, episode_successes)
 
     stream      = torch.cat(flat,       dim=0)
     stream_lab  = torch.cat(flat_labels, dim=0)
@@ -344,7 +346,15 @@ def pack_to_blocks(
         not_pad  = (in_ids.unsqueeze(-1) != -1) & (in_ids.unsqueeze(1) != -1)
         attn_mask = same_seq & not_pad
 
-    return PackedBatch(input_ids, labels, loss_mask, attn_mask, position_ids, sources)
+    return PackedBatch(
+        input_ids,
+        labels,
+        loss_mask,
+        attn_mask,
+        position_ids,
+        sources,
+        episode_successes,
+    )
 
 
 class PackedCollator:
@@ -365,9 +375,10 @@ class PackedCollator:
         self.return_attn_mask = return_attn_mask
 
     def __call__(self, batch) -> PackedBatch:
-        seqs:    List[torch.Tensor] = []
-        labels:  List[torch.Tensor] = []
-        sources: List[int]          = []
+        seqs:              List[torch.Tensor] = []
+        labels:            List[torch.Tensor] = []
+        sources:           List[int]          = []
+        episode_successes: List[float]        = []
 
         for item in batch:
             if isinstance(item, dict):
@@ -376,6 +387,9 @@ class PackedCollator:
                 if "src" in item:
                     v = item["src"]
                     sources.append(int(v.item() if torch.is_tensor(v) else v))
+                if "episode_success" in item:
+                    v = item["episode_success"]
+                    episode_successes.append(float(v.item() if torch.is_tensor(v) else v))
             else:
                 s, l = item, item
 
@@ -395,6 +409,7 @@ class PackedCollator:
             drop_last        = self.drop_last,
             return_attn_mask = self.return_attn_mask,
             sources          = sources or None,
+            episode_successes = episode_successes or None,
         )
 
 

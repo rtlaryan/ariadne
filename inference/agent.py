@@ -17,6 +17,7 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
+from ariadne.core.action_sim import apply_key_to_readout
 from ariadne.core.dataset import StateSerializer
 from ariadne.core.model import AgentTransformer, build_model, load_checkpoint
 from ariadne.core.tokenizer import TokenMap
@@ -188,22 +189,11 @@ class Agent:
     # Expression simulation
     # ------------------------------------------------------------------
 
-    _FUNCTIONS  = {"sin", "cos", "tan", "log", "ln", "sqrt"}
-    _KEY_DISPLAY = {"pi": "π"}
     _NORMALIZE   = {"×": "*", "÷": "/", "⌫": "", " ": ""}
 
     @classmethod
     def _simulate(cls, current: str, action: str) -> str:
-        if action in ("m", "Enter", "="):
-            return current
-        if action == "Backspace":
-            return current[:-1] if current else ""
-        if action == "Escape":
-            return ""
-        text = cls._KEY_DISPLAY.get(action, action)
-        if action in cls._FUNCTIONS:
-            text += "("
-        return current + text
+        return apply_key_to_readout(current, action)
 
     @classmethod
     def _norm(cls, expr: str) -> str:

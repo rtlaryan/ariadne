@@ -214,6 +214,27 @@ def _count_episodes(files: list[str]) -> tuple[int, int]:
     return ep_count, step_count
 
 
+def _episode_success(episode: list[dict]) -> bool:
+    """Infer whether an episode completed successfully."""
+    if not episode:
+        return False
+
+    final_step = episode[-1]
+    if "success" in final_step:
+        return bool(final_step.get("success", False))
+
+    action = final_step.get("action", {})
+    if isinstance(action, dict):
+        key = action.get("key")
+    else:
+        key = action
+
+    if key is None:
+        return False
+
+    return _KEY_NORMALIZE.get(str(key), str(key)) == "Enter"
+
+
 # ---------------------------------------------------------------------------
 # File categorization
 # ---------------------------------------------------------------------------
@@ -304,6 +325,7 @@ class SoftwareTrajectoryDataset(IterableDataset):
       input_ids : LongTensor [L]   (or [max_len] when use_packing=False)
       labels    : LongTensor [L]   (-100 for non-action positions)
       src       : LongTensor []    (0=supervised, 1=crawler, 2=dagger)
+      episode_success : FloatTensor [] (1.0 if the episode finished successfully)
 
     Parameters
     ----------
@@ -384,6 +406,7 @@ class SoftwareTrajectoryDataset(IterableDataset):
         T  = len(episode)
         t  = random.randint(0, T - 1)
         st = episode[t]
+        episode_success = float(_episode_success(episode))
 
         mode = st.get("mode", "unknown")
 
@@ -436,9 +459,10 @@ class SoftwareTrajectoryDataset(IterableDataset):
             labels    = labels    + [-100]   * pad_len
 
         return {
-            "input_ids": torch.tensor(input_ids, dtype=torch.long),
-            "labels":    torch.tensor(labels,    dtype=torch.long),
-            "src":       torch.tensor(src_id,    dtype=torch.long),
+            "input_ids":        torch.tensor(input_ids,       dtype=torch.long),
+            "labels":           torch.tensor(labels,          dtype=torch.long),
+            "src":              torch.tensor(src_id,          dtype=torch.long),
+            "episode_success":  torch.tensor(episode_success, dtype=torch.float32),
         }
 
     # ------------------------------------------------------------------

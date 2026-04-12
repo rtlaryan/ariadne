@@ -1,6 +1,6 @@
-experiment_name: "benchmark"
+experiment_name: "dagger_test"
 base_save_dir: "runs"
-overwrite: false
+overwrite: true
 reset_scheduler: false
 
 # Model Architecture
@@ -29,22 +29,22 @@ data_generation:
 
 # Phase 1: Pre-training
 pretrain:
-  enabled: false
+  enabled: true
   run_name: "pre_train"
   epochs: 20
   batch_size: 1024
   lr: 3e-4
   data_dir: "dataset"          # path to supervised data
   #max_episodes: 75000 
-  # resume_from:              # optional: path to a checkpoint to seed from
+  resume_from: "runs/exp_256_4_4/pre_train/checkpoints/pre_train_best.pt"             # optional: path to a checkpoint to seed from
 
 # Phase 2: DAgger Loop
 dagger:
   enabled: true
-  iterations: 50
+  iterations: 10
 
   generation:
-    episodes_per_iter: 15000
+    episodes_per_iter: 5000
     workers: 8
     remote_clients: true
     history_window: -1
@@ -58,10 +58,10 @@ dagger:
     max_depth: [6, 6, 6, 7, 7, 7, 8]
 
   training:
-    epochs: 20
+    epochs: 10
     batch_size: 1024
     lr: 1e-4
-    lr_decay: .98             # multiplicative decay applied across DAgger iterations
+    lr_decay: 1.0             # multiplicative decay applied across DAgger iterations
     expert_multiplier: 0.25    # ratio of expert episodes per dagger episode
     decay_factor: 0.8          # probability of keeping data:  factor^age
 
