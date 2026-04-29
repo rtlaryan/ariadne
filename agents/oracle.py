@@ -17,6 +17,7 @@ FUNCTIONS = ["sin", "cos", "tan", "log", "ln", "sqrt", "inv"]
 OPERATIONS = ["+", "-", "*", "/"]
 RICH_OPERATIONS = ["+", "-", "*", "/", "%", "^"]
 CONSTANTS = ["pi", "e"]
+SCIENTIFIC_PLAN_KEYS = SCIENTIFIC_FUNCTIONS | frozenset(CONSTANTS) | {"^", "!"}
 
 
 @dataclass(frozen=True)
@@ -48,7 +49,7 @@ class CalculatorTask:
 
     @property
     def scientific(self) -> bool:
-        return "scientific_mode" in self.features or any(key in self.plan for key in SCIENTIFIC_FUNCTIONS | CONSTANTS | {"^", "!"})
+        return "scientific_mode" in self.features or any(key in self.plan for key in SCIENTIFIC_PLAN_KEYS)
 
     @property
     def goal_type(self) -> str:

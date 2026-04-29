@@ -221,8 +221,12 @@ class GenAgent:
                     self.end_headers()
                     self.wfile.write(json.dumps(action).encode())
                 except Exception as exc:
-                    print(f"[GenAgent] Error: {exc}")
-                    self.send_response(500); self.end_headers()
+                    import traceback
+                    traceback.print_exc()
+                    self.send_response(500)
+                    self.send_header("Content-type", "text/plain")
+                    self.end_headers()
+                    self.wfile.write(str(exc).encode())
 
         socketserver.TCPServer.allow_reuse_address = True
         server = socketserver.TCPServer(("", self.port), Handler)

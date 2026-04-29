@@ -378,11 +378,13 @@ class EvalWorker:
                     self.send_header("Content-type", "application/json")
                     self.end_headers()
                     self.wfile.write(json.dumps(action).encode())
-                except Exception:
+                except Exception as exc:
                     import traceback
                     traceback.print_exc()
                     self.send_response(500)
+                    self.send_header("Content-type", "text/plain")
                     self.end_headers()
+                    self.wfile.write(str(exc).encode())
 
         class ThreadedServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
             allow_reuse_address = True
