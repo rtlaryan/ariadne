@@ -1,0 +1,342 @@
+# Data-generation-only Ariadne configuration.
+#
+# Use this when you only want to collect calculator interaction data and skip
+# pretraining, DAgger, RL, and evaluation. This config is written for the
+# current network setup where browser bridge clients run on separate machines.
+#
+# Run from /home/aryan/projects/auxila:
+#   PYTHONPATH=/home/aryan/projects/auxila .venv/bin/python -m ariadne.orchestrate \
+#     --config ariadne/configs/data_generation_only.yaml
+
+# Human-readable experiment/run name. Used to derive run directories under
+# base_save_dir when a phase writes experiment-scoped artifacts.
+experiment_name: "data_generation_only"
+
+# Root directory for orchestrator run outputs, relative to the Ariadne repo
+# unless an absolute path is supplied.
+base_save_dir: "runs"
+
+# If true, phases may delete/replace existing run outputs. Keep false for data
+# generation so resumable JSONL files are not accidentally discarded.
+overwrite: false
+
+# If true, training schedulers reset on resume. Irrelevant while all training
+# phases are disabled, but kept explicit for consistency with full configs.
+reset_scheduler: false
+
+# Model architecture fields are included because shared config loaders and later
+# phases expect them to exist, even though data generation itself does not train
+# or load a model.
+
+# Token embedding width for transformer models used by later training phases.
+embed_dim: 256
+
+# Number of transformer layers for later training phases.
+num_layers: 8
+
+# Number of attention heads for later training phases.
+num_heads: 8
+
+# Maximum tokenized sequence length for dataset/model examples.
+max_len: 196
+
+# Packed-collator block size used during training; not used during collection.
+block_size: 4096
+
+# Whether later training phases should pack multiple examples into blocks.
+use_packing: true
+
+# Transformer dropout for later training phases.
+dropout: 0.1
+
+# ---------------------------------------------------------------------------
+# Phase 0: Data Generation
+# ---------------------------------------------------------------------------
+data_generation:
+  # Enable the only active phase in this config.
+  enabled: true
+
+  # Dataset source to collect.
+  #   supervised: oracle/expert actions for generated calculator tasks
+  #   crawler: exploratory calculator interaction data
+  #   both: older convenience mode; current resumable orchestration supports
+  #         supervised or crawler individually, so prefer one concrete mode.
+  mode: "supervised"
+
+  # Directory for generated JSONL files. Because experiment_specific is false
+  # below, this resolves from the project root as /home/aryan/projects/auxila/dataset.
+  output_dir: "dataset"
+
+  # If true, output_dir is nested under this experiment's run directory. If
+  # false, output_dir is resolved from the auxila project root and can be shared
+  # across runs/training configs.
+  experiment_specific: false
+
+  # Total target episodes across all workers. The orchestrator splits this count
+  # over workers and resumes from existing matching dataset_*.jsonl files.
+  episodes: 300000
+
+  # Number of Ariadne generation workers/HTTP ports. Workers bind sequentially
+  # from base port 9000: worker 0 -> 9000, worker 1 -> 9001, etc.
+  workers: 18
+
+  # If true, restrict oracle generation to basic calculator tasks. Keep false to
+  # include the rich features added in the oracle/eval rework: scientific mode,
+  # constants, functions, powers, factorials, decimals, grouping, and angle mode.
+  basic_only: false
+
+  # Number of previous actions to include in model-visible state.
+  #   -1: full action history
+  #    0: no action history
+  #   >0: most recent N actions
+  history_window: -1
+
+  # If true, do not launch local Selenium/browser clients. The workers wait for
+  # bridge clients running elsewhere on the network. This is the expected setup
+  # for your browser machines.
+  remote_clients: true
+
+  # Timeout cushion for the orchestrator relative to observed collection rate.
+  # Increase this if remote browser clients are slow or the network is noisy.
+  timeout_safety_multiplier: 3.0
+
+  # Minimum generated oracle expression depth. 1 keeps easy tasks in the mix.
+  min_depth: 1
+
+  # Maximum generated oracle expression depth. Larger values create longer,
+  # richer tasks and plans. Scalar only for phase 0 data generation.
+  max_depth: 6
+
+# ---------------------------------------------------------------------------
+# Phase 1: Pre-training disabled
+# ---------------------------------------------------------------------------
+pretrain:
+  # Skip supervised pretraining in this data-only config.
+  enabled: false
+
+  # Run subdirectory name used by normal pretraining configs.
+  run_name: "pre_train"
+
+  # Training epochs if pretraining is enabled in a copied config.
+  epochs: 20
+
+  # Training batch size if pretraining is enabled in a copied config.
+  batch_size: 1024
+
+  # Learning rate if pretraining is enabled in a copied config.
+  lr: 3e-4
+
+  # Dataset directory consumed by pretraining if enabled later.
+  data_dir: "dataset"
+
+  # Optional checkpoint path to seed later phases when pretraining is disabled.
+  # Leave null for pure data generation.
+  resume_from: null
+
+# ---------------------------------------------------------------------------
+# Phase 2: DAgger disabled
+# ---------------------------------------------------------------------------
+dagger:
+  # Skip DAgger collection/training in this data-only config.
+  enabled: false
+
+  # Number of DAgger iterations if enabled in a copied config.
+  iterations: 0
+
+  generation:
+    # Episodes collected per DAgger iteration if DAgger is enabled.
+    episodes_per_iter: 0
+
+    # Number of DAgger collection workers if enabled.
+    workers: 8
+
+    # Whether DAgger uses remote browser bridge clients if enabled.
+    remote_clients: true
+
+    # DAgger action-history window; same semantics as data_generation.history_window.
+    history_window: -1
+
+    # Maximum oracle corrections before aborting one DAgger episode.
+    max_corrections: 10
+
+    # Episode step cap as oracle_plan_length * max_steps_multiplier.
+    max_steps_multiplier: 2.0
+
+    # If true, the DAgger expert can recover from some agent mistakes instead of
+    # immediately ending/correcting every off-plan action.
+    allow_recovery_mistakes: true
+
+    # Probability/rate controlling recoverable mistakes when recovery is enabled.
+    recoverable_mistake_rate: 0.5
+
+    # Worker exits after this many seconds without bridge requests.
+    idle_timeout: 120
+
+    # Orchestrator timeout cushion for DAgger generation if enabled.
+    timeout_safety_multiplier: 3.0
+
+    # Minimum oracle task depth for DAgger generation if enabled.
+    min_depth: 1
+
+    # Maximum oracle task depth for DAgger generation if enabled. DAgger accepts
+    # either a scalar or a per-iteration list.
+    max_depth: 6
+
+  training:
+    # Epochs per DAgger training iteration if enabled.
+    epochs: 0
+
+    # Batch size for DAgger training if enabled.
+    batch_size: 1024
+
+    # Base learning rate for DAgger training if enabled.
+    lr: 3e-4
+
+    # Multiplicative learning-rate decay across DAgger iterations.
+    lr_decay: 0.99
+
+    # Ratio of original expert episodes mixed with DAgger episodes.
+    expert_multiplier: 0.25
+
+    # Age-based probability decay for retaining older DAgger data.
+    decay_factor: 0.8
+
+# ---------------------------------------------------------------------------
+# Phase 3: Reinforcement Learning disabled
+# ---------------------------------------------------------------------------
+rl:
+  # Skip PPO/RL rollout and training in this data-only config.
+  enabled: false
+
+  # Number of PPO iterations if enabled.
+  iterations: 0
+
+  # Optional checkpoint to seed RL actor/reference policy if enabled.
+  resume_from: null
+
+  rollout:
+    # Rollout episodes collected per PPO iteration if enabled.
+    episodes_per_iter: 0
+
+    # Number of rollout workers if enabled.
+    workers: 8
+
+    # Whether rollout workers wait for remote browser bridge clients.
+    remote_clients: true
+
+    # Episode step cap as oracle_plan_length * max_steps_multiplier.
+    max_steps_multiplier: 2.0
+
+    # Worker exits after this many seconds without bridge requests.
+    idle_timeout: 120
+
+    # Orchestrator timeout cushion for rollout collection if enabled.
+    timeout_safety_multiplier: 3.0
+
+    # Reward for valid-prefix non-terminal actions; invalid steps get the
+    # opposite sign. Usually 0.0 when terminal reward is the main signal.
+    step_bonus: 0.0
+
+    # Rollout policy decoding mode: greedy, sample, or epsilon_greedy.
+    decode: "sample"
+
+    # Sampling temperature for rollout policy when decode is sample.
+    temperature: 1.0
+
+    # Top-k sampling cutoff. 0 disables top-k filtering.
+    top_k: 0
+
+    # Nucleus/top-p sampling cutoff. 1.0 disables top-p truncation.
+    top_p: 0.95
+
+    # Random action rate used only by epsilon_greedy decoding.
+    epsilon: 0.02
+
+    # Minimum oracle task depth for rollout tasks if enabled.
+    min_depth: 1
+
+    # Maximum oracle task depth for rollout tasks if enabled.
+    max_depth: 7
+
+  training:
+    # PPO optimizer learning rate if RL training is enabled.
+    lr: 1e-5
+
+    # Multiplicative LR decay across PPO iterations.
+    lr_decay: 0.995
+
+    # Linear warm-up steps inside one PPO iteration. 0 disables warm-up.
+    lr_warmup_steps: 0
+
+    # Cosine LR floor ratio: final LR = lr * lr_min_ratio.
+    lr_min_ratio: 0.05
+
+    # Reward discount factor.
+    gamma: 0.99
+
+    # Generalized Advantage Estimation smoothing factor.
+    gae_lambda: 0.95
+
+    # Number of PPO passes over the same rollout batch.
+    ppo_epochs: 4
+
+    # PPO minibatch size over flattened transitions.
+    minibatch_size: 64
+
+    # PPO probability-ratio clipping threshold.
+    clip_ratio: 0.2
+
+    # Critic/value loss weight in the total PPO objective.
+    value_loss_coef: 0.5
+
+    # Entropy bonus weight for exploration.
+    entropy_coef: 0.001
+
+    # Early-stop threshold if PPO updates move too far in one iteration.
+    target_kl: 0.02
+
+    # Optional KL penalty against frozen seed/reference policy. 0 disables it.
+    reference_kl_coef: 0.0
+
+    # Gradient clipping threshold.
+    max_grad_norm: 0.5
+
+    # Skip PPO update if rollout success rate is below this threshold.
+    min_success_rate: 0.0
+
+# ---------------------------------------------------------------------------
+# Phase 4: Evaluation disabled
+# ---------------------------------------------------------------------------
+evaluation:
+  # Skip diagnostic evaluation in this data-only config.
+  enabled: false
+
+  # Checkpoint selector/path if evaluation is enabled: latest or explicit path.
+  checkpoint: "latest"
+
+  # Diagnostic suite preset: smoke, standard, or full.
+  suite: "standard"
+
+  # Number of eval workers if evaluation is enabled.
+  workers: 8
+
+  # First HTTP port for eval workers.
+  base_port: 9000
+
+  # Whether eval workers wait for external browser bridge clients.
+  remote_clients: true
+
+  # Whether local browser clients run headless when remote_clients is false.
+  headless: true
+
+  # Eval policy decoding mode. Greedy is the default for deterministic eval.
+  decode_mode: "greedy"
+
+  # Directory for evaluation artifacts.
+  output_dir: "evaluation"
+
+  # Eval step cap as oracle_plan_length * max_steps_multiplier.
+  max_steps_multiplier: 2.0
+
+  # If true, only writes suite.jsonl/manifest.json and does not launch workers.
+  dry_run_suite: false
