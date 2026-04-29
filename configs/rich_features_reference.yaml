@@ -1,0 +1,323 @@
+# Rich calculator/oracle/evaluation reference configuration.
+#
+# This file is documentation-first: it is meant as a compact reference for the
+# canonical calculator contract and the richer oracle/eval features added in the
+# rich-oracle-and-eval rework. It is safe to copy sections from here into live
+# experiment configs, but the live orchestrator currently reads the phase blocks
+# such as `data_generation`, `dagger`, `rl`, and `evaluation` from the main
+# experiment YAML files.
+
+version: 1
+name: rich_features_reference
+status: reference_only
+
+calculator_contract:
+  canonical_state:
+    readout: string
+    history: list
+    mode:
+      values: [basic, scientific]
+    angleMode:
+      values: [deg, rad]
+      serialized_token: "angleMode:"
+    availableInteractions:
+      description: Canonical action keys exposed by window.icalcState, not display labels.
+  canonical_actions:
+    digits: ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
+    binary_operators: ["+", "-", "*", "/", "%", "^"]
+    grouping: ["(", ")"]
+    decimal: ["."]
+    controls:
+      enter: "Enter"
+      backspace: "Backspace"
+      clear: "Escape"
+      mode_toggle: "m"
+      angle_toggle: "deg"
+      inverse_toggle: "inv"
+    scientific_functions: [sin, cos, tan, log, ln, sqrt]
+    constants: [pi, e]
+    postfix: ["!"]
+  display_aliases:
+    description: Ariadne may normalize historical/display labels, but iCalc should expose canonical keys.
+    examples:
+      "÷": "/"
+      "×": "*"
+      "⌫": "Backspace"
+      "AC": "Escape"
+      "π": "pi"
+      "√": "sqrt"
+
+oracle:
+  default_profile: rich_v1
+  legacy_profile: basic_v1
+  typed_task_api:
+    class: CalculatorTask
+    required_fields:
+      - expression
+      - plan
+      - expected
+      - angle_mode
+      - category
+      - seed
+      - metadata
+    derived_fields:
+      - task_canonical
+      - features
+      - depth
+      - token_length
+      - scientific
+      - goal_type
+      - expected_value
+      - expected_error
+  generation_depth:
+    min_depth: 1
+    max_depth: 7
+    max_depth_may_be_scalar_or_per_iteration_list: true
+  angle_mode_generation:
+    trig_deg: deg
+    trig_rad: rad
+    rich_default_rad_probability: 0.25
+  categories:
+    arithmetic:
+      - basic_integer
+      - mixed_basic
+      - mixed
+      - decimal_arithmetic
+      - parentheses
+      - modulo
+    scientific:
+      - power
+      - factorial
+      - constants
+      - constants_pi
+      - constants_e
+      - sqrt
+      - inv
+      - log
+      - ln
+      - unary_function
+      - mixed_scientific
+      - decimal_plus_function
+      - constants_plus_power
+      - nested_functions
+    angle_modes:
+      - trig_deg
+      - trig_rad
+      - angle_trig
+  feature_tags:
+    arithmetic: [add, subtract, multiply, divide, percent]
+    numeric: [integer, decimal]
+    scientific: [power, factorial, scientific_mode]
+    constants: [pi, e]
+    functions: [sin, cos, tan, trig, log, ln, sqrt, inv]
+    syntax: [grouping]
+    errors: [invalid, invalid_math, domain_error]
+  invalid_math_policy:
+    training_generation: avoid_invalid_expressions
+    evaluation: include_explicit_error_state_bucket
+
+agent_logging:
+  data_generation_agents:
+    - supervised/gen_agent
+    - dagger_agent
+    - rl_agent
+  task_metadata_fields:
+    - task_canonical
+    - features
+    - angle_mode
+    - goal_type
+    - expected_value
+    - expected_error
+    - task_metadata
+  rollout_episode_fields:
+    - goal
+    - task_canonical
+    - features
+    - angle_mode
+    - goal_type
+    - expected_value
+    - task_metadata
+    - episode_return
+    - steps
+
+tokenizer_and_dataset:
+  state_tokens:
+    - "mode:"
+    - "angleMode:"
+    - "keys:"
+    - "readout:"
+    - "past:"
+  seeded_angle_tokens:
+    deg: 42
+    "angleMode:": 57
+    rad: 58
+  canonical_rich_action_tokens:
+    - "/"
+    - "*"
+    - "%"
+    - "^"
+    - "!"
+    - "sin"
+    - "cos"
+    - "tan"
+    - "log"
+    - "ln"
+    - "sqrt"
+    - "pi"
+    - "e"
+    - "deg"
+    - "inv"
+    - "Enter"
+    - "Backspace"
+    - "Escape"
+
+evaluation:
+  package: ariadne.eval
+  presets:
+    smoke:
+      arithmetic: 20
+      decimals_constants: 10
+      functions: 10
+      angle_modes: 5
+      error_states: 5
+    standard:
+      arithmetic: 200
+      decimals_constants: 100
+      functions: 100
+      angle_modes: 50
+      error_states: 50
+    full:
+      arithmetic: 800
+      decimals_constants: 400
+      functions: 400
+      angle_modes: 200
+      error_states: 200
+  reserved_seed_ranges:
+    arithmetic: 1000000
+    decimals_constants: 2000000
+    functions: 3000000
+    angle_modes: 4000000
+    error_states: 5000000
+  suite_case_fields:
+    - task_id
+    - expression
+    - task_canonical
+    - bucket
+    - stratum
+    - angle_mode
+    - expected_value
+    - expected_error
+    - oracle_plan
+    - oracle_plan_length
+    - seed
+    - features
+    - metadata
+  scoring_dimensions:
+    - entry_success
+    - result_success
+    - error_success
+    - success
+    - first_divergence_step
+  output_artifacts:
+    - suite.jsonl
+    - manifest.json
+    - worker_outputs
+    - episodes.ndjson
+    - summary.json
+    - summary.md
+  local_dry_run_example:
+    command: >-
+      PYTHONPATH=/home/aryan/projects/auxila .venv/bin/python -m ariadne.eval.run
+      --config /home/aryan/projects/auxila/ariadne/configs/experiment.yaml
+      --suite smoke
+      --dry-run-suite
+      --output-dir /tmp/ariadne_eval_smoke
+    expected_suite_cases: 50
+  network_browser_runs:
+    local_default: false
+    note: Browser-backed end-to-end evals are expected to run manually on a separate network machine.
+
+phase_config_reference:
+  data_generation:
+    enabled: false
+    mode: supervised
+    output_dir: dataset
+    experiment_specific: false
+    episodes: 300000
+    workers: 18
+    basic_only: false
+    history_window: -1
+    remote_clients: true
+    timeout_safety_multiplier: 3.0
+    min_depth: 1
+    max_depth: 6
+  dagger:
+    enabled: true
+    iterations: 35
+    generation:
+      episodes_per_iter: 15000
+      workers: 8
+      remote_clients: true
+      history_window: -1
+      max_corrections: 10
+      max_steps_multiplier: 2.0
+      allow_recovery_mistakes: true
+      recoverable_mistake_rate: 0.5
+      idle_timeout: 120
+      timeout_safety_multiplier: 3.0
+      min_depth: 1
+      max_depth: [6, 6, 6, 7, 7, 7]
+    training:
+      epochs: 20
+      batch_size: 1024
+      lr: 3e-4
+      lr_decay: 0.99
+      expert_multiplier: 0.25
+      decay_factor: 0.8
+  rl:
+    enabled: true
+    iterations: 100
+    resume_from: null
+    rollout:
+      episodes_per_iter: 1000
+      workers: 8
+      remote_clients: true
+      max_steps_multiplier: 2.0
+      idle_timeout: 120
+      timeout_safety_multiplier: 3.0
+      step_bonus: 0.0
+      decode: sample
+      temperature: 1.0
+      top_k: 0
+      top_p: 0.95
+      epsilon: 0.02
+      min_depth: 1
+      max_depth: 7
+    training:
+      lr: 1e-5
+      lr_decay: 0.995
+      lr_warmup_steps: 0
+      lr_min_ratio: 0.05
+      gamma: 0.99
+      gae_lambda: 0.95
+      ppo_epochs: 4
+      minibatch_size: 64
+      clip_ratio: 0.2
+      value_loss_coef: 0.5
+      entropy_coef: 0.001
+      target_kl: 0.02
+      reference_kl_coef: 0.0
+      max_grad_norm: 0.5
+      min_success_rate: 0.0
+  evaluation:
+    enabled: false
+    checkpoint: latest
+    suite: standard
+    workers: 8
+    base_port: 9000
+    remote_clients: true
+    headless: true
+    decode_mode: greedy
+    output_dir: evaluation
+    max_steps_multiplier: 2.0
+    dry_run_suite: false
