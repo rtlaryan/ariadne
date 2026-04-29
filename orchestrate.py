@@ -326,6 +326,13 @@ def _needs_seed_model(cfg: dict) -> bool:
 # Parallel worker runner — used by phases 0, 2 (gen), and 3 (rollout)
 # ---------------------------------------------------------------------------
 
+def _format_duration(seconds: float) -> str:
+    total_seconds = max(0, int(seconds))
+    hours, rem = divmod(total_seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
 def _run_workers(
     agent_cmds:        list[list[str]],
     target_episodes:   int,
@@ -427,10 +434,10 @@ def _run_workers(
                     timeout = (remaining_target / measured_rate) * timeout_safety
                     print(
                         f"\n[Orchestrate] Diagnostic: {measured_rate:.1f} ep/s → "
-                        f"timeout {timeout:.0f}s"
+                        f"timeout {_format_duration(timeout)}"
                     )
 
-            eta = f"{int((target_episodes - total) / rate)}s" if rate > 0 else "…"
+            eta = _format_duration((target_episodes - total) / rate) if rate > 0 else "…"
             pct = total / target_episodes if target_episodes else 0
             bar = ("=" * int(30 * pct)).ljust(30, "-")
             sys.stdout.write(
@@ -568,7 +575,9 @@ def phase_datagen(cfg: dict, exp_dir: str) -> Optional[str]:
         client_cmd = [sys.executable, "client_runner.py",
                       "--server-ip", "127.0.0.1",
                       "--workers",   str(workers),
-                      "--headless"]
+                      "--headless",
+                      "--quiet",
+                      "--request-timeout", "120"]
         client_cwd = os.path.dirname(runner)
 
     _run_workers(
@@ -736,7 +745,8 @@ def phase_dagger(cfg: dict, exp_dir: str, start_model: str) -> str:
                 runner = os.path.abspath(os.path.join(HERE, "..", "icalc", "client_runner.py"))
                 client_cmd = [sys.executable, "client_runner.py",
                               "--server-ip", "127.0.0.1",
-                              "--workers",    str(workers), "--headless"]
+                              "--workers",    str(workers), "--headless", "--quiet",
+                              "--request-timeout", "120"]
                 client_cwd = os.path.dirname(runner)
 
             _run_workers(
@@ -913,7 +923,8 @@ def phase_rl(cfg: dict, exp_dir: str, start_model: str) -> str:
                 runner = os.path.abspath(os.path.join(HERE, "..", "icalc", "client_runner.py"))
                 client_cmd = [sys.executable, "client_runner.py",
                               "--server-ip", "127.0.0.1",
-                              "--workers",    str(workers), "--headless"]
+                              "--workers",    str(workers), "--headless", "--quiet",
+                              "--request-timeout", "120"]
                 client_cwd = os.path.dirname(runner)
 
             if cmds:

@@ -74,11 +74,11 @@ data_generation:
 
   # Total target episodes across all workers. The orchestrator splits this count
   # over workers and resumes from existing matching dataset_*.jsonl files.
-  episodes: 300000
+  episodes: 1000000
 
   # Number of Ariadne generation workers/HTTP ports. Workers bind sequentially
   # from base port 9000: worker 0 -> 9000, worker 1 -> 9001, etc.
-  workers: 18
+  workers: 16
 
   # If true, restrict oracle generation to basic calculator tasks. Keep false to
   # include the rich features added in the oracle/eval rework: scientific mode,
@@ -94,7 +94,7 @@ data_generation:
   # If true, do not launch local Selenium/browser clients. The workers wait for
   # bridge clients running elsewhere on the network. This is the expected setup
   # for your browser machines.
-  remote_clients: true
+  remote_clients: false
 
   # Timeout cushion for the orchestrator relative to observed collection rate.
   # Increase this if remote browser clients are slow or the network is noisy.
