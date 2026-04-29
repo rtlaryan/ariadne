@@ -89,14 +89,16 @@ class GenAgent:
     def _new_episode(self, state: dict) -> None:
         global_index = (self.completed_episodes * self.total_shards) + self.shard_id
         current_mode = state.get("mode", "basic")
-        expr, plan   = self.oracle.generate_task_for_index(
+        task = self.oracle.generate_task_for_index(
             global_index,
             current_mode=current_mode,
             basic_only=self.basic_only,
             min_depth=self.min_depth,
             max_depth=self.max_depth,
         )
-        self.current_task     = (expr, plan)
+        if not hasattr(task, "plan") or not hasattr(task, "expression"):
+            raise TypeError("Oracle.generate_task_for_index() must return a CalculatorTask")
+        self.current_task = task
         self.current_step_idx = 0
         self.episode_id       = str(uuid.uuid4())
         self.episode_actions  = []
@@ -126,7 +128,8 @@ class GenAgent:
                 self._new_episode(state)
 
             if self.current_task and not is_reset:
-                expr, plan = self.current_task
+                task = self.current_task
+                plan = task.plan
                 if self.current_step_idx < len(plan):
                     key = plan[self.current_step_idx]
                     action = {"type": "keypress", "key": key}
@@ -150,7 +153,8 @@ class GenAgent:
                 "episode_id": self.episode_id,
                 "timestamp":  time.time(),
                 "mode":       self.mode,
-                "task":       self.current_task[0] if self.current_task else None,
+                "task":       self.current_task.expression if self.current_task else None,
+                "task_metadata": self.current_task.to_dict() if self.current_task else None,
                 "step_index": self.current_step_idx,
                 "state":      state,
                 "action":     action,

@@ -6,6 +6,7 @@ Runs all four phases of the training pipeline:
   Phase 1: Pre-training
   Phase 2: DAgger Loop
   Phase 3: RL Loop
+  Phase 4: Evaluation
 
 Each phase is an idempotent function: if outputs already exist it is
 skipped unless the config says otherwise.
@@ -17,6 +18,7 @@ Usage:
 import argparse
 import glob
 import json
+import math
 import os
 import queue
 import re
@@ -200,6 +202,76 @@ def _summarize_dagger_episodes(directory: str) -> Optional[dict]:
     }
 
 
+def _summarize_rl_rollouts(directory: str) -> Optional[dict]:
+    """Aggregate episode-level PPO rollout summaries from rollout JSONL files."""
+    returns: list[float] = []
+    steps: list[int] = []
+    success = 0
+    fallback_rates: list[float] = []
+    chosen_probs: list[float] = []
+    entropies: list[float] = []
+
+    for path in glob.glob(os.path.join(directory, "**/*.jsonl"), recursive=True):
+        try:
+            with open(path, "r") as f:
+                for raw in f:
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    try:
+                        ep = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    ep_steps = ep.get("steps", [])
+                    returns.append(float(ep.get("episode_return", 0.0)))
+                    steps.append(int(ep.get("num_steps", len(ep_steps))))
+                    success += int(bool(ep.get("success", False)))
+                    if ep_steps:
+                        fallback_rates.append(
+                            sum(int(bool(step.get("fallback", 0))) for step in ep_steps) / float(len(ep_steps))
+                        )
+                        step_probs = [
+                            float(step.get("chosen_prob"))
+                            for step in ep_steps
+                            if step.get("chosen_prob") is not None
+                        ]
+                        if step_probs:
+                            chosen_probs.append(sum(step_probs) / float(len(step_probs)))
+                        step_ents = [
+                            float(step.get("entropy"))
+                            for step in ep_steps
+                            if step.get("entropy") is not None and math.isfinite(float(step.get("entropy")))
+                        ]
+                        if step_ents:
+                            entropies.append(sum(step_ents) / float(len(step_ents)))
+        except OSError:
+            pass
+
+    if not returns:
+        return None
+
+    sorted_returns = sorted(returns)
+    mid = len(sorted_returns) // 2
+    if len(sorted_returns) % 2 == 0:
+        median_return = 0.5 * (sorted_returns[mid - 1] + sorted_returns[mid])
+    else:
+        median_return = sorted_returns[mid]
+
+    return {
+        "episodes": len(returns),
+        "successes": success,
+        "success_rate": success / float(len(returns)),
+        "avg_return": sum(returns) / float(len(returns)),
+        "median_return": median_return,
+        "min_return": min(returns),
+        "max_return": max(returns),
+        "avg_steps": sum(steps) / float(len(steps)),
+        "avg_fallback_rate": (sum(fallback_rates) / float(len(fallback_rates))) if fallback_rates else 0.0,
+        "avg_chosen_prob": (sum(chosen_probs) / float(len(chosen_probs))) if chosen_probs else 0.0,
+        "avg_entropy": (sum(entropies) / float(len(entropies))) if entropies else 0.0,
+    }
+
+
 def _resolve_from_project_root(path: str) -> str:
     """Resolve a config path relative to the ariadne top-level directory."""
     if os.path.isabs(path):
@@ -212,6 +284,37 @@ def _resolve_from_package_dir(path: str) -> str:
     if os.path.isabs(path):
         return path
     return os.path.abspath(os.path.join(HERE, path))
+
+
+def _describe_checkpoint_source(path: str, cfg: dict, exp_dir: str) -> str:
+    """Return a human-readable source label for a checkpoint path."""
+    if not path:
+        return "none"
+
+    abs_path = os.path.abspath(path)
+
+    rl_resume = cfg.get("rl", {}).get("resume_from")
+    if rl_resume and os.path.abspath(_resolve_from_package_dir(rl_resume)) == abs_path:
+        return "rl.resume_from"
+
+    pre_resume = cfg.get("pretrain", {}).get("resume_from")
+    if pre_resume and os.path.abspath(_resolve_from_package_dir(pre_resume)) == abs_path:
+        return "pretrain.resume_from"
+
+    if f"{os.sep}dagger_iter_" in abs_path:
+        return "DAgger checkpoint"
+
+    pretrain_run = cfg.get("pretrain", {}).get("run_name", "pre_train")
+    if f"{os.sep}{pretrain_run}{os.sep}" in abs_path:
+        return "pre-train checkpoint"
+
+    if f"{os.sep}rl_iter_" in abs_path:
+        return "previous RL checkpoint"
+
+    if exp_dir and abs_path.startswith(os.path.abspath(exp_dir) + os.sep):
+        return "experiment checkpoint"
+
+    return "external checkpoint"
 
 
 def _needs_seed_model(cfg: dict) -> bool:
@@ -689,10 +792,14 @@ def phase_dagger(cfg: dict, exp_dir: str, start_model: str) -> str:
             json.dump(cfg_for_iter, f)
             tmp_cfg = f.name
 
+        shared_tb_dir = os.path.join(exp_dir, "dagger_progress", "logs")
+        os.makedirs(shared_tb_dir, exist_ok=True)
+
         _run_cmd([sys.executable, "-m", "ariadne.trainers._dagger_main",
                   "--config", tmp_cfg,
                   "--run-dir", run_dir,
-                  "--resume-from", current_model])
+                  "--resume-from", current_model,
+                  "--tb-log-dir", shared_tb_dir])
         os.unlink(tmp_cfg)
 
         new_ckpt = _find_checkpoint(run_dir)
@@ -732,6 +839,14 @@ def phase_rl(cfg: dict, exp_dir: str, start_model: str) -> str:
     reference_model= rl_cfg.get("resume_from", start_model) or start_model
 
     tok_path = _discover_tokenizer(exp_dir, start_model)
+    actor_source = _describe_checkpoint_source(current_model, cfg, exp_dir)
+    reference_source = _describe_checkpoint_source(reference_model, cfg, exp_dir)
+    print(f"[Orchestrate] RL actor seed: {actor_source} -> {current_model}")
+    if os.path.abspath(reference_model) == os.path.abspath(current_model):
+        print(f"[Orchestrate] RL reference policy: same as actor seed -> {reference_model}")
+    else:
+        print(f"[Orchestrate] RL reference policy: {reference_source} -> {reference_model}")
+        print("[Orchestrate] Note: rl.resume_from currently changes the frozen reference policy, not the PPO actor initialization.")
 
     # Resume: find last completed RL iter
     start_iter = 0
@@ -740,6 +855,9 @@ def phase_rl(cfg: dict, exp_dir: str, start_model: str) -> str:
         if _find_checkpoint(run_dir):
             start_iter = i + 1
             current_model = _find_checkpoint(run_dir)
+    if start_iter > 0:
+        resumed_source = _describe_checkpoint_source(current_model, cfg, exp_dir)
+        print(f"[Orchestrate] Resuming RL from {resumed_source} -> {current_model}")
 
     reset_sched = cfg.get("reset_scheduler", False)
 
@@ -752,12 +870,22 @@ def phase_rl(cfg: dict, exp_dir: str, start_model: str) -> str:
         # Rollout
         existing = _count_jsonl_lines(rollout_dir)
         if existing < ep_per_iter:
+            remaining = ep_per_iter - existing
             cur_min_depth = min_depths[min(i, len(min_depths) - 1)] if isinstance(min_depths, list) else min_depths
             cur_max_depth = max_depths[min(i, len(max_depths) - 1)] if isinstance(max_depths, list) else max_depths
+            print(
+                f"[Orchestrate] RL rollout settings: collect {remaining} more episodes "
+                f"(target {ep_per_iter}, existing {existing}) | "
+                f"decode={rollout_cfg.get('decode', 'sample')} temp={rollout_cfg.get('temperature', 1.0)} "
+                f"top_p={rollout_cfg.get('top_p', 0.95)} top_k={rollout_cfg.get('top_k', 0)} "
+                f"depth={cur_min_depth}-{cur_max_depth}"
+            )
 
             cmds = []
             for w in range(workers):
-                ep  = ep_per_iter // workers + (1 if w < ep_per_iter % workers else 0)
+                ep  = remaining // workers + (1 if w < remaining % workers else 0)
+                if ep <= 0:
+                    continue
                 cmd = [
                     sys.executable, "-m", "ariadne.agents.rl_agent",
                     "--model-path",        current_model,
@@ -770,8 +898,11 @@ def phase_rl(cfg: dict, exp_dir: str, start_model: str) -> str:
                     "--max-steps-multiplier", str(rollout_cfg.get("max_steps_multiplier", 2.0)),
                     "--idle-timeout",      str(rollout_cfg.get("idle_timeout", 120)),
                     "--step-bonus",        str(rollout_cfg.get("step_bonus", 0.0)),
-                    "--decode",            rollout_cfg.get("decode", "greedy"),
+                    "--decode",            rollout_cfg.get("decode", "sample"),
                     "--temperature",       str(rollout_cfg.get("temperature", 1.0)),
+                    "--top-k",             str(rollout_cfg.get("top_k", 0)),
+                    "--top-p",             str(rollout_cfg.get("top_p", 0.95)),
+                    "--epsilon",           str(rollout_cfg.get("epsilon", 0.02)),
                     "--min-depth",         str(cur_min_depth),
                     "--max-depth",         str(cur_max_depth),
                 ]
@@ -785,15 +916,30 @@ def phase_rl(cfg: dict, exp_dir: str, start_model: str) -> str:
                               "--workers",    str(workers), "--headless"]
                 client_cwd = os.path.dirname(runner)
 
-            _run_workers(
-                agent_cmds      = cmds,
-                target_episodes = ep_per_iter,
-                phase_label     = f"RL rollout {i+1}",
-                remote_clients  = remote_clients,
-                client_cmd      = client_cmd,
-                client_cwd      = client_cwd,
-                idle_timeout    = rollout_cfg.get("idle_timeout", 120),
-                timeout_safety  = rollout_cfg.get("timeout_safety_multiplier", 3.0),
+            if cmds:
+                _run_workers(
+                    agent_cmds      = cmds,
+                    target_episodes = ep_per_iter,
+                    phase_label     = f"RL rollout {i+1}",
+                    remote_clients  = remote_clients,
+                    client_cmd      = client_cmd,
+                    client_cwd      = client_cwd,
+                    idle_timeout    = rollout_cfg.get("idle_timeout", 120),
+                    timeout_safety  = rollout_cfg.get("timeout_safety_multiplier", 3.0),
+                    base_completed  = existing,
+                )
+        rollout_summary = _summarize_rl_rollouts(rollout_dir)
+        if rollout_summary:
+            print(
+                "[Orchestrate] RL rollout summary: "
+                f"{rollout_summary['successes']}/{rollout_summary['episodes']} success ({rollout_summary['success_rate']:.1%}) | "
+                f"return avg/med/min/max "
+                f"{rollout_summary['avg_return']:.3f}/{rollout_summary['median_return']:.3f}/"
+                f"{rollout_summary['min_return']:.3f}/{rollout_summary['max_return']:.3f} | "
+                f"avg steps {rollout_summary['avg_steps']:.1f} | "
+                f"avg entropy {rollout_summary['avg_entropy']:.3f} | "
+                f"avg chosen_prob {rollout_summary['avg_chosen_prob']:.3f} | "
+                f"avg fallback_rate {rollout_summary['avg_fallback_rate']:.1%}"
             )
 
         # RL Training
@@ -829,6 +975,50 @@ def phase_rl(cfg: dict, exp_dir: str, start_model: str) -> str:
         tok_path = _discover_tokenizer(run_dir, current_model)
 
     return current_model
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: Evaluation
+# ---------------------------------------------------------------------------
+
+def phase_evaluation(cfg: dict, exp_dir: str, final_model: str) -> None:
+    eval_cfg = cfg.get("evaluation", {})
+    if not eval_cfg.get("enabled", False):
+        print("[Orchestrate] Evaluation disabled — skipping.")
+        return
+    if not final_model and eval_cfg.get("checkpoint", "latest") == "latest":
+        raise RuntimeError("Evaluation requires a checkpoint, but no final model was produced.")
+
+    print("=== Phase 4: Evaluation ===")
+    exp_cfg_path = os.path.join(exp_dir, "experiment.yaml")
+    cmd = [sys.executable, "-m", "ariadne.eval.run", "--config", exp_cfg_path, "--exp-dir", exp_dir]
+    checkpoint = eval_cfg.get("checkpoint")
+    if checkpoint and checkpoint != "latest":
+        cmd.extend(["--checkpoint", str(checkpoint)])
+    elif final_model:
+        cmd.extend(["--model-path", final_model])
+    if eval_cfg.get("suite"):
+        cmd.extend(["--suite", str(eval_cfg["suite"])])
+    if eval_cfg.get("workers") is not None:
+        cmd.extend(["--workers", str(eval_cfg["workers"])])
+    if eval_cfg.get("base_port") is not None:
+        cmd.extend(["--base-port", str(eval_cfg["base_port"])])
+    if eval_cfg.get("remote_clients") is not None:
+        if bool(eval_cfg.get("remote_clients", False)):
+            cmd.append("--remote-clients")
+        else:
+            cmd.append("--local-clients")
+    if eval_cfg.get("decode_mode"):
+        cmd.extend(["--decode-mode", str(eval_cfg["decode_mode"])])
+    if eval_cfg.get("output_dir"):
+        cmd.extend(["--output-dir", str(eval_cfg["output_dir"])])
+    if eval_cfg.get("max_steps_multiplier") is not None:
+        cmd.extend(["--max-steps-multiplier", str(eval_cfg["max_steps_multiplier"])])
+    if bool(eval_cfg.get("headless", True)):
+        cmd.append("--headless")
+    else:
+        cmd.append("--headed")
+    _run_cmd(cmd)
 
 
 # ---------------------------------------------------------------------------
@@ -896,6 +1086,9 @@ def main():
 
     # Phase 3
     model = phase_rl(cfg, exp_dir, model)
+
+    # Phase 4
+    phase_evaluation(cfg, exp_dir, model)
 
     print(f"[Orchestrate] All phases complete. Final model: {model}")
 

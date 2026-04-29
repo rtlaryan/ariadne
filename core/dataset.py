@@ -19,23 +19,19 @@ import glob
 import json
 import os
 import random
-from typing import Iterator, List, Optional
+from typing import Iterator, Optional
 
 import torch
 from torch.utils.data import IterableDataset
+
+from ariadne.core.calculator_spec import DISPLAY_TO_CANONICAL, canonicalize_key
 
 
 # ---------------------------------------------------------------------------
 # Key normalization — display symbols → canonical action tokens
 # ---------------------------------------------------------------------------
 
-_KEY_NORMALIZE: dict[str, str] = {
-    "÷": "/",
-    "×": "*",
-    "⌫": "Backspace",
-    "AC": "Escape",
-    "=": "Enter",
-}
+_KEY_NORMALIZE: dict[str, str] = dict(DISPLAY_TO_CANONICAL)
 
 
 # ---------------------------------------------------------------------------
@@ -128,12 +124,17 @@ class StateSerializer:
             for h in hist:
                 tokens.extend(self._tokenize_val(h))
 
+        # angle mode
+        if "angleMode" in state:
+            tokens.append("angleMode:")
+            tokens.append(str(state.get("angleMode", "deg")))
+
         # available keys
         avail = state.get("availableInteractions", [])
         if avail:
             tokens.append("keys:")
             for k in avail:
-                k_norm = _KEY_NORMALIZE.get(k, k)
+                k_norm = canonicalize_key(k)
                 tokens.extend(self._tokenize_val(k_norm))
 
         # action history

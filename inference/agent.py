@@ -15,6 +15,7 @@ import os
 from typing import Optional
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from ariadne.core.action_sim import apply_key_to_readout
@@ -55,8 +56,18 @@ class Agent:
 
         # Build + load model
         self.model = build_model(cfg).to(device)
-        load_checkpoint(self.model, model_path, device=device)
+        ckpt = load_checkpoint(self.model, model_path, device=device)
         self.model.eval()
+        self.value_head = nn.Linear(cfg.get("embed_dim", 256), 1).to(device)
+        nn.init.zeros_(self.value_head.weight)
+        nn.init.zeros_(self.value_head.bias)
+        value_state = ckpt.get("value_head_state_dict")
+        if value_state:
+            try:
+                self.value_head.load_state_dict(value_state, strict=True)
+            except Exception:
+                pass
+        self.value_head.eval()
 
         self.max_len       = cfg.get("max_len", 256)
         self._hist: list[str] = []
@@ -138,6 +149,29 @@ class Agent:
                 last      = last + mask   # additive, not in-place
 
         return last
+
+    def policy_logits_and_value(self, goal: str, state: dict) -> tuple[dict, torch.Tensor, float]:
+        """Return masked policy logits and critic value for a single state."""
+        state_copy, inp = self._prepare_input(goal, state)
+        with torch.no_grad():
+            raw_logits, hidden = self.model(inp, return_hidden_states=True)
+            value = float(self.value_head(hidden[:, -1, :]).squeeze(-1).item())
+        last = raw_logits[0, -1, :].clone()
+
+        avail = state_copy.get("availableInteractions", [])
+        if avail:
+            from ariadne.core.dataset import _KEY_NORMALIZE
+            ids = [
+                self.tokenizer.token_to_id[_KEY_NORMALIZE.get(k, k)]
+                for k in avail
+                if _KEY_NORMALIZE.get(k, k) in self.tokenizer.token_to_id
+            ]
+            if ids:
+                mask = torch.full((len(self.tokenizer),), float("-inf"), device=self.device)
+                mask[ids] = 0.0
+                last = last + mask
+
+        return state_copy, last, value
 
     # ------------------------------------------------------------------
     # Public API

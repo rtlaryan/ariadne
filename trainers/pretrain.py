@@ -175,7 +175,13 @@ class Trainer:
     model_version, dropout).
     """
 
-    def __init__(self, cfg: dict, run_dir: str, use_dagger: bool = False) -> None:
+    def __init__(
+        self,
+        cfg: dict,
+        run_dir: str,
+        use_dagger: bool = False,
+        tb_log_dir: Optional[str] = None,
+    ) -> None:
         self.cfg        = cfg
         self.run_dir    = run_dir
         self.use_dagger = use_dagger
@@ -205,6 +211,7 @@ class Trainer:
         self.current_iteration = int(train_cfg.get("current_iteration", 1))
         self.max_episodes      = train_cfg.get("max_episodes")
         self.effective_lr      = self._effective_base_lr()
+        self.iteration_index   = max(0, self.current_iteration - 1) if self.use_dagger else 0
 
         # Architecture
         self.embed_dim   = cfg.get("embed_dim",   256)
@@ -219,7 +226,7 @@ class Trainer:
 
         os.makedirs(os.path.join(run_dir, "checkpoints"), exist_ok=True)
         self.ckpt_dir   = os.path.join(run_dir, "checkpoints")
-        self.log_dir    = os.path.join(run_dir, "logs")
+        self.log_dir    = tb_log_dir if tb_log_dir else os.path.join(run_dir, "logs")
         self.device     = "cuda" if torch.cuda.is_available() else "cpu"
 
         self._setup_tokenizer()
@@ -238,6 +245,18 @@ class Trainer:
             return self.lr
         decay_step = max(0, self.current_iteration - 1)
         return self.lr * (self.lr_decay ** decay_step)
+
+    def _phase_prefix(self) -> str:
+        return "DAgger" if self.use_dagger else "Pretrain"
+
+    def _iteration_step(self) -> int:
+        return self.current_iteration if self.use_dagger else 0
+
+    def _global_step_offset(self) -> int:
+        return self.iteration_index * self.epochs * max(1, self.steps_per_epoch)
+
+    def _epoch_step_offset(self) -> int:
+        return self.iteration_index * self.epochs
 
     def _setup_tokenizer(self) -> None:
         tok_path = self._tokenizer_path()
@@ -409,8 +428,10 @@ class Trainer:
             )
         )
 
-        writer    = SummaryWriter(self.log_dir)
-        global_step = 0
+        writer = SummaryWriter(self.log_dir)
+        phase_prefix = self._phase_prefix()
+        global_step = self._global_step_offset()
+        epoch_offset = self._epoch_step_offset()
         best_loss   = float("inf")
         dagger_metrics = _load_dagger_collection_metrics(self.data_dirs) if self.use_dagger else None
         if dagger_metrics:
@@ -425,19 +446,48 @@ class Trainer:
                     f" avg_recovery_steps={dagger_metrics['avg_recovery_steps']:.2f}"
                 )
             print(msg)
-            writer.add_scalar("DAgger/collection_success_rate", dagger_metrics["success_rate"], 0)
-            writer.add_scalar("DAgger/collection_episodes", dagger_metrics["episodes"], 0)
+            writer.add_scalar(
+                "DAgger/Collection/success_rate",
+                dagger_metrics["success_rate"],
+                self._iteration_step(),
+            )
+            writer.add_scalar(
+                "DAgger/Collection/episodes",
+                dagger_metrics["episodes"],
+                self._iteration_step(),
+            )
             if "avg_steps" in dagger_metrics:
-                writer.add_scalar("DAgger/collection_avg_steps", dagger_metrics["avg_steps"], 0)
-                writer.add_scalar("DAgger/collection_avg_corrections", dagger_metrics["avg_corrections"], 0)
-                writer.add_scalar("DAgger/collection_avg_policy_mistakes", dagger_metrics["avg_policy_mistakes"], 0)
-                writer.add_scalar("DAgger/collection_avg_override_steps", dagger_metrics["avg_override_steps"], 0)
-                writer.add_scalar("DAgger/collection_avg_recovery_steps", dagger_metrics["avg_recovery_steps"], 0)
+                writer.add_scalar(
+                    "DAgger/Collection/avg_steps",
+                    dagger_metrics["avg_steps"],
+                    self._iteration_step(),
+                )
+                writer.add_scalar(
+                    "DAgger/Collection/avg_corrections",
+                    dagger_metrics["avg_corrections"],
+                    self._iteration_step(),
+                )
+                writer.add_scalar(
+                    "DAgger/Collection/avg_policy_mistakes",
+                    dagger_metrics["avg_policy_mistakes"],
+                    self._iteration_step(),
+                )
+                writer.add_scalar(
+                    "DAgger/Collection/avg_override_steps",
+                    dagger_metrics["avg_override_steps"],
+                    self._iteration_step(),
+                )
+                writer.add_scalar(
+                    "DAgger/Collection/avg_recovery_steps",
+                    dagger_metrics["avg_recovery_steps"],
+                    self._iteration_step(),
+                )
 
         for epoch in range(self._start_epoch, self._start_epoch + self.epochs):
             self.model.train()
             epoch_loss = epoch_acc = epoch_episode_success = epoch_n = 0
             epoch_episode_count = 0
+            epoch_step = epoch_offset + epoch
 
             pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{self._start_epoch + self.epochs} [{self.run_name}]")
             for batch in pbar:
@@ -492,9 +542,13 @@ class Trainer:
                 epoch_n    += 1
                 global_step += 1
 
-                writer.add_scalar("Loss/train_step", l, global_step)
-                writer.add_scalar("Acc/train_step",  acc, global_step)
-                writer.add_scalar("Success/episode_step", batch_episode_success, global_step)
+                writer.add_scalar(f"{phase_prefix}/Train/loss_step", l, global_step)
+                writer.add_scalar(f"{phase_prefix}/Train/accuracy_step", acc, global_step)
+                writer.add_scalar(
+                    f"{phase_prefix}/Train/episode_success_step",
+                    batch_episode_success,
+                    global_step,
+                )
 
                 pbar.set_postfix(
                     {
@@ -520,13 +574,21 @@ class Trainer:
             avg_loss = epoch_loss / max(1, epoch_n)
             avg_acc  = epoch_acc  / max(1, epoch_n)
             avg_episode_success = epoch_episode_success / max(1, epoch_episode_count)
-            writer.add_scalar("Loss/train_epoch", avg_loss, epoch)
-            writer.add_scalar("Acc/train_epoch",  avg_acc,  epoch)
-            writer.add_scalar("Success/episode_epoch", avg_episode_success, epoch)
+            writer.add_scalar(f"{phase_prefix}/Train/loss_epoch", avg_loss, epoch_step)
+            writer.add_scalar(f"{phase_prefix}/Train/accuracy_epoch", avg_acc, epoch_step)
+            writer.add_scalar(
+                f"{phase_prefix}/Train/episode_success_epoch",
+                avg_episode_success,
+                epoch_step,
+            )
 
             # Advance the epoch-level LR scheduler
             scheduler.step()
-            writer.add_scalar("Loss/learning_rate", self.optimizer.param_groups[0]["lr"], epoch)
+            writer.add_scalar(
+                f"{phase_prefix}/Train/learning_rate",
+                self.optimizer.param_groups[0]["lr"],
+                epoch_step,
+            )
 
             print(
                 f"[Trainer] Epoch {epoch+1} | Loss {avg_loss:.4f} | Acc {avg_acc:.4f} "

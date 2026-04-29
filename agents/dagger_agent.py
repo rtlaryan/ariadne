@@ -92,7 +92,8 @@ class DAggerAgent:
         self.agent  = Agent(model_path, tokenizer_path, device=device)
         self.agent.history_window = history_window
 
-        self.current_task:   tuple | None = None  # (expr, plan, trajectory)
+        self.current_task = None
+        self.current_trajectory: list[dict] = []
         self.episode_id      = str(uuid.uuid4())
         self.episode_actions: list[str] = []
         self.corrections     = 0
@@ -118,11 +119,13 @@ class DAggerAgent:
 
     def _new_episode(self, state: dict) -> None:
         idx        = (self.completed * self.total_shards) + self.shard_id
-        expr, plan = self.oracle.generate_task_for_index(
+        task = self.oracle.generate_task_for_index(
             idx, min_depth=self.min_depth, max_depth=self.max_depth
         )
-        traj       = _precompute_trajectory(plan)
-        self.current_task    = (expr, plan, traj)
+        if not hasattr(task, "plan") or not hasattr(task, "expression"):
+            raise TypeError("Oracle.generate_task_for_index() must return a CalculatorTask")
+        self.current_task = task
+        self.current_trajectory = _precompute_trajectory(task.plan)
         self.episode_id      = str(uuid.uuid4())
         self.episode_actions = []
         self.corrections     = 0
@@ -134,6 +137,7 @@ class DAggerAgent:
     def _finish(self, success: bool, reason: str, task: str) -> None:
         self._write_episode_summary(task, success, reason)
         self.current_task  = None
+        self.current_trajectory = []
         self.pending_reset = True
         self.completed    += 1
         if success:
@@ -170,7 +174,8 @@ class DAggerAgent:
                 return action
             self._new_episode(state)
 
-        expr, plan, traj = self.current_task
+        task = self.current_task
+        expr, plan, traj = task.expression, task.plan, self.current_trajectory
         current_expr = _normalize_readout(state.get("readout", ""))
 
         # --- Oracle labeling ---
@@ -255,6 +260,12 @@ class DAggerAgent:
             "episode_id": self.episode_id,
             "mode":       "dagger",
             "task":       expr,
+            "task_canonical": task.task_canonical,
+            "features": sorted(task.features),
+            "angle_mode": task.angle_mode,
+            "goal_type": task.goal_type,
+            "expected_value": task.expected_value,
+            "task_metadata": task.to_dict(),
             "state":      state,
             "action":     {"type": "keypress", "key": expert_action},
         }

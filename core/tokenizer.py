@@ -64,6 +64,9 @@ class TokenMap:
         for episode in episode_iterator:
             for step in episode:
                 state = step.get("state", {})
+                if "angleMode" in state:
+                    self._add("angleMode:")
+                    self._add(str(state.get("angleMode", "deg")))
                 for tok in state.get("availableInteractions", []):
                     k_norm = _KEY_NORMALIZE.get(tok, tok)
                     self._add(str(k_norm))

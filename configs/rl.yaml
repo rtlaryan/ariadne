@@ -1,12 +1,12 @@
-experiment_name: "dagger_test"
+experiment_name: "rl_from_dagger_256_8_8"
 base_save_dir: "runs"
-overwrite: true
+overwrite: false              # delete the existing experiment dir on restart so RL begins fresh
 reset_scheduler: false
 
 # Model Architecture
 embed_dim: 256
-num_layers: 4
-num_heads: 4
+num_layers: 8
+num_heads: 8
 max_len: 196
 block_size: 4096
 use_packing: true
@@ -14,9 +14,9 @@ dropout: 0.1
 
 # Phase 0: Dataset Generation
 data_generation:
-  enabled: false
-  mode: "supervised"           # "supervised", "crawler", or "both"
-  output_dir: "dataset"        # relative to project root (or experiment dir if experiment_specific)
+  enabled: false             # skip dataset generation for this RL-only config
+  mode: "supervised"
+  output_dir: "dataset"
   experiment_specific: false
   episodes: 300000
   workers: 18
@@ -29,22 +29,21 @@ data_generation:
 
 # Phase 1: Pre-training
 pretrain:
-  enabled: true
+  enabled: false             # skip pretrain and seed the actor from resume_from instead
   run_name: "pre_train"
   epochs: 20
   batch_size: 1024
   lr: 3e-4
-  data_dir: "dataset"          # path to supervised data
-  #max_episodes: 75000 
-  resume_from: "runs/exp_256_4_4/pre_train/checkpoints/pre_train_best.pt"             # optional: path to a checkpoint to seed from
+  data_dir: "dataset"
+  resume_from: "/home/aryan/projects/auxila/ariadne/runs/benchmark_256_8_8/dagger_iter_34/checkpoints/dagger_iter_34_best.pt"
 
 # Phase 2: DAgger Loop
 dagger:
-  enabled: true
-  iterations: 10
+  enabled: false             # skip DAgger entirely
+  iterations: 35
 
   generation:
-    episodes_per_iter: 5000
+    episodes_per_iter: 15000
     workers: 8
     remote_clients: true
     history_window: -1
@@ -55,34 +54,34 @@ dagger:
     idle_timeout: 120
     timeout_safety_multiplier: 3.0
     min_depth: 1
-    max_depth: [6, 6, 6, 7, 7, 7, 8]
+    max_depth: [6, 6, 6, 7, 7, 7]
 
   training:
-    epochs: 10
+    epochs: 20
     batch_size: 1024
-    lr: 1e-4
-    lr_decay: 1.0             # multiplicative decay applied across DAgger iterations
-    expert_multiplier: 0.25    # ratio of expert episodes per dagger episode
-    decay_factor: 0.8          # probability of keeping data:  factor^age
+    lr: 3e-4
+    lr_decay: 0.99
+    expert_multiplier: 0.25
+    decay_factor: 0.8
 
 # Phase 3: Reinforcement Learning
 rl:
-  enabled: false
-  iterations: 5
-  # resume_from:               # optional: seed RL from a previous checkpoint
+  enabled: true
+  iterations: 100
+  resume_from: "/home/aryan/projects/auxila/ariadne/runs/benchmark_256_8_8/dagger_iter_34/checkpoints/dagger_iter_34_best.pt"  # frozen PPO reference policy; keep aligned with pretrain.resume_from for a clean restart
 
   rollout:
-    episodes_per_iter: 1000      # total rollout episodes collected per PPO iteration
-    workers: 8                   # number of parallel RL rollout workers
-    remote_clients: true         # true = wait for external bridge clients, false = launch local clients
-    max_steps_multiplier: 2.0    # terminate an episode after oracle_plan_len * multiplier steps
-    idle_timeout: 120            # worker exits if no bridge requests arrive for this many seconds
+    episodes_per_iter: 1000     # total rollout episodes collected per PPO iteration
+    workers: 8                  # number of parallel RL rollout workers
+    remote_clients: true        # true = wait for external bridge clients, false = launch local clients
+    max_steps_multiplier: 2.0   # terminate an episode after oracle_plan_len * multiplier steps
+    idle_timeout: 120           # worker exits if no bridge requests arrive for this many seconds
     timeout_safety_multiplier: 3.0  # orchestrator timeout cushion over observed rollout rate
     step_bonus: 0.0             # reward for valid-prefix non-terminal actions; invalid steps get the opposite sign
     decode: "sample"            # rollout policy: "greedy", "sample", or "epsilon_greedy"
     temperature: 1.0            # sampling temperature; higher = more exploratory, lower = sharper
     top_k: 0                    # sample only from top-k actions (0 disables top-k filtering)
-    top_p: 0.95                 # nucleus sampling cutoff; keep the smallest set of actions with cumulative prob <= top_p
+    top_p: 1.0                 # nucleus sampling cutoff; keep the smallest set of actions with cumulative prob <= top_p
     epsilon: 0.02               # random-action rate used only by "epsilon_greedy"
     min_depth: 1                # minimum oracle expression depth for rollout tasks
     max_depth: 7                # maximum oracle expression depth for rollout tasks
@@ -90,7 +89,7 @@ rl:
   training:
     lr: 1e-5
     lr_decay: 0.995             # multiplicative decay applied across RL iterations (iter-level)
-    lr_warmup_steps: 0          # linear warm-up steps within one RL iteration (0 = disabled)
+    lr_warmup_steps: 5          # linear warm-up steps within one RL iteration (0 = disabled)
     lr_min_ratio: 0.05          # cosine floor: final LR = lr * lr_min_ratio
     gamma: 0.99                 # reward discount factor
     gae_lambda: 0.95            # GAE smoothing; lower = lower variance, higher = less bias
@@ -99,7 +98,20 @@ rl:
     clip_ratio: 0.2             # PPO ratio clipping threshold
     value_loss_coef: 0.5        # critic loss weight in the total objective
     entropy_coef: 0.001         # entropy bonus weight for exploration
-    target_kl: 0.02             # early-stop threshold if PPO updates move too far in one iteration
+    target_kl: 0.05             # early-stop threshold if PPO updates move too far in one iteration
     reference_kl_coef: 0.0      # optional penalty against the frozen seed/reference policy (0 disables it)
     max_grad_norm: 0.5          # gradient clipping threshold
     min_success_rate: 0.0       # skip PPO training if rollout success rate falls below this
+
+# Phase 4: Evaluation
+evaluation:
+  enabled: true               # skip evaluation in this RL-only config
+  checkpoint: "latest"
+  suite: "standard"
+  workers: 8
+  base_port: 9000
+  remote_clients: true
+  headless: true
+  decode_mode: "greedy"
+  output_dir: "evaluation"
+  max_steps_multiplier: 2.0

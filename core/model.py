@@ -170,7 +170,8 @@ class AgentTransformer(nn.Module):
         input_ids: torch.Tensor,
         attn_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        return_hidden_states: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         B, T = input_ids.shape
         if position_ids is None:
             if T > self.max_len:
@@ -182,7 +183,11 @@ class AgentTransformer(nn.Module):
         x   = self.drop(self.tok_emb(input_ids) + self.pos_emb(pos))
         for block in self.layers:
             x = block(x, attn_mask=attn_mask)
-        return self.head(self.norm(x))
+        hidden = self.norm(x)
+        logits = self.head(hidden)
+        if return_hidden_states:
+            return logits, hidden
+        return logits
 
 
 # ---------------------------------------------------------------------------

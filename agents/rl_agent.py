@@ -14,6 +14,8 @@ STATUS lines written to stdout:
 """
 
 import argparse
+from collections import deque
+import copy
 import http.server
 import json
 import os
@@ -67,7 +69,6 @@ def _is_valid_prefix(current: str, goal: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def _compute_rewards(goal: str, steps: list[dict], success: bool, step_bonus: float) -> tuple[float, list[float]]:
-    ep_reward    = 1.0 if success else 0.0
     step_rewards = []
     for s in steps:
         action  = s.get("action", "")
@@ -79,7 +80,9 @@ def _compute_rewards(goal: str, steps: list[dict], success: bool, step_bonus: fl
             step_rewards.append(step_bonus)
         else:
             step_rewards.append(-step_bonus if step_bonus > 0 else -0.1)
-    return ep_reward + sum(step_rewards), step_rewards
+    if step_rewards and success:
+        step_rewards[-1] += 1.0
+    return sum(step_rewards), step_rewards
 
 
 # ---------------------------------------------------------------------------
@@ -161,10 +164,10 @@ class RLAgent:
         max_steps_mult:  float = 2.0,
         idle_timeout:    int   = 120,
         step_bonus:      float = 0.0,
-        decode:          str   = "greedy",
+        decode:          str   = "sample",
         temperature:     float = 1.0,
         top_k:           int   = 0,
-        top_p:           float = 1.0,
+        top_p:           float = 0.95,
         epsilon:         float = 0.02,
         log_decode_stats: bool = True,
         min_depth:       int   = 1,
@@ -193,7 +196,7 @@ class RLAgent:
         self.agent  = Agent(model_path, tokenizer_path, device=self.device)
         self.agent.history_window = history_window
 
-        self.current_task: tuple | None = None  # (expr, plan)
+        self.current_task = None
         self.episode_id      = str(uuid.uuid4())
         self.episode_steps:  list[dict] = []
         self.completed       = 0
@@ -205,6 +208,12 @@ class RLAgent:
         self._write_buf: list[str] = []
         self._FLUSH_SIZE = 10
         self._dataset_file = None
+        self._recent_returns: deque[float] = deque(maxlen=25)
+        self._recent_steps: deque[int] = deque(maxlen=25)
+        self._recent_successes: deque[int] = deque(maxlen=25)
+        self._recent_entropies: deque[float] = deque(maxlen=25)
+        self._recent_chosen_probs: deque[float] = deque(maxlen=25)
+        self._recent_fallback_rates: deque[float] = deque(maxlen=25)
 
     # ------------------------------------------------------------------
     # Step
@@ -223,38 +232,31 @@ class RLAgent:
             if not _is_clean(state):
                 return {"type": "keypress", "key": "Escape"}
             idx        = (self.completed * self.total_shards) + self.shard_id
-            expr, plan = self.oracle.generate_task_for_index(
+            task = self.oracle.generate_task_for_index(
                 idx, min_depth=self.min_depth, max_depth=self.max_depth
             )
-            self.current_task  = (expr, plan)
+            if not hasattr(task, "plan") or not hasattr(task, "expression"):
+                raise TypeError("Oracle.generate_task_for_index() must return a CalculatorTask")
+            self.current_task = task
             self.episode_id    = str(uuid.uuid4())
             self.episode_steps = []
 
-        expr, plan = self.current_task
+        task = self.current_task
+        expr, plan = task.expression, task.plan
 
         # Model inference
         state_copy = state.copy()
-        hist = self.agent.action_history
+        hist = list(self.agent.action_history)
         if self.agent.history_window > 0:
             hist = hist[-self.agent.history_window:]
-        state_copy["action_history"] = hist
+        state_copy["action_history"] = list(hist)
 
         try:
-            goal_toks  = self.agent.serializer.tokenize_expr(expr)
-            state_toks = self.agent.serializer.serialize(state_copy)
-            full       = ["[GOAL]"] + goal_toks + ["[STATE]"] + state_toks + ["[ACTION]"]
-            ids        = self.agent.tokenizer.encode(full)
-            inp        = torch.tensor([ids], dtype=torch.long).to(self.device)
-
-            with torch.no_grad():
-                logits     = self.agent.model(inp)
-                last_logits = logits[0, -1, :]
-
-            avail   = state_copy.get("availableInteractions", [])
-            mask    = _act_mask(self.agent, avail, self.device)
-            masked  = last_logits + mask if mask is not None else last_logits
+            state_copy, masked, value_pred = self.agent.policy_logits_and_value(expr, state_copy)
 
             valid_ids = None
+            avail = state_copy.get("availableInteractions", [])
+            mask = _act_mask(self.agent, avail, self.device)
             if mask is not None:
                 valid_ids = (mask == 0).nonzero(as_tuple=True)[0].tolist()
 
@@ -272,9 +274,20 @@ class RLAgent:
             print(f"[RLAgent] Model error: {exc}")
             model_key = "Enter"
             log_prob  = 0.0
+            value_pred = 0.0
             stats     = {}
 
-        step_rec = {"state": state_copy, "action": model_key, "log_prob": log_prob, "step_index": len(self.episode_steps)}
+        # Freeze the observed state at action time so later mutations do not
+        # retroactively change older rollout transitions.
+        frozen_state = copy.deepcopy(state_copy)
+
+        step_rec = {
+            "state": frozen_state,
+            "action": model_key,
+            "old_log_prob": log_prob,
+            "value_pred": value_pred,
+            "step_index": len(self.episode_steps),
+        }
         if self.log_decode_stats:
             step_rec.update({
                 "entropy":      stats.get("entropy"),
@@ -298,16 +311,29 @@ class RLAgent:
 
         if ep_done:
             total_r, step_rs = _compute_rewards(expr, self.episode_steps, success, self.step_bonus)
+            for idx, (step, reward) in enumerate(zip(self.episode_steps, step_rs)):
+                step["reward"] = reward
+                step["done"] = idx == len(self.episode_steps) - 1
+            decode_summary = self._episode_decode_summary()
             ep_entry = {
                 "episode_id":    self.episode_id,
+                "goal":          expr,
                 "task":          expr,
+                "task_canonical": task.task_canonical,
+                "features":      sorted(task.features),
+                "angle_mode":    task.angle_mode,
+                "goal_type":     task.goal_type,
+                "expected_value": task.expected_value,
+                "task_metadata": task.to_dict(),
                 "success":       success,
-                "reward":        total_r,
+                "episode_return": total_r,
                 "num_steps":     len(self.episode_steps),
                 "steps":         self.episode_steps,
-                "step_rewards":  step_rs,
                 "decode_mode":   self.decode,
                 "temperature":   self.temperature,
+                "top_k":         self.top_k,
+                "top_p":         self.top_p,
+                "epsilon":       self.epsilon,
             }
             self._write(ep_entry)
             self.pending_reset = True
@@ -315,14 +341,24 @@ class RLAgent:
             self.completed    += 1
             if success:
                 self.successful += 1
+            self._recent_returns.append(total_r)
+            self._recent_steps.append(len(self.episode_steps))
+            self._recent_successes.append(int(success))
+            self._recent_entropies.append(decode_summary["avg_entropy"])
+            self._recent_chosen_probs.append(decode_summary["avg_chosen_prob"])
+            self._recent_fallback_rates.append(decode_summary["fallback_rate"])
             rate   = self.successful / self.completed if self.completed else 0
             status = "✓" if success else "✗"
             print(
                 f"Episode {self.completed} [{status}] {expr} "
-                f"(steps={len(self.episode_steps)}, reward={total_r:.2f}, success_rate={rate:.1%})",
+                f"(steps={len(self.episode_steps)}, reward={total_r:.2f}, success_rate={rate:.1%}, "
+                f"entropy={decode_summary['avg_entropy']:.3f}, chosen_prob={decode_summary['avg_chosen_prob']:.3f}, "
+                f"fallback={decode_summary['fallback_rate']:.1%})",
                 flush=True
             )
             print(f"STATUS:EPISODE_COMPLETE:{self.completed}", flush=True)
+            if self.completed % self._recent_returns.maxlen == 0:
+                self._print_window_summary("Recent rollout summary")
 
         self.agent.record_action(model_key)
         return action
@@ -339,6 +375,42 @@ class RLAgent:
             self._dataset_file.writelines(self._write_buf)
             self._dataset_file.flush()
             self._write_buf.clear()
+
+    def _episode_decode_summary(self) -> dict:
+        entropies = [
+            float(step.get("entropy"))
+            for step in self.episode_steps
+            if step.get("entropy") is not None
+        ]
+        chosen_probs = [
+            float(step.get("chosen_prob"))
+            for step in self.episode_steps
+            if step.get("chosen_prob") is not None
+        ]
+        fallback_rate = (
+            sum(int(bool(step.get("fallback", 0))) for step in self.episode_steps) / float(len(self.episode_steps))
+            if self.episode_steps else 0.0
+        )
+        return {
+            "avg_entropy": (sum(entropies) / float(len(entropies))) if entropies else 0.0,
+            "avg_chosen_prob": (sum(chosen_probs) / float(len(chosen_probs))) if chosen_probs else 0.0,
+            "fallback_rate": fallback_rate,
+        }
+
+    def _print_window_summary(self, label: str) -> None:
+        if not self._recent_returns:
+            return
+        print(
+            f"[RLAgent:{self.port}] {label} | "
+            f"window={len(self._recent_returns)} ep | "
+            f"success={sum(self._recent_successes) / float(len(self._recent_successes)):.1%} | "
+            f"return={sum(self._recent_returns) / float(len(self._recent_returns)):.3f} | "
+            f"steps={sum(self._recent_steps) / float(len(self._recent_steps)):.1f} | "
+            f"entropy={sum(self._recent_entropies) / float(len(self._recent_entropies)):.3f} | "
+            f"chosen_prob={sum(self._recent_chosen_probs) / float(len(self._recent_chosen_probs)):.3f} | "
+            f"fallback={sum(self._recent_fallback_rates) / float(len(self._recent_fallback_rates)):.1%}",
+            flush=True,
+        )
 
     # ------------------------------------------------------------------
     # Server
@@ -401,6 +473,7 @@ class RLAgent:
                     print(f"STATUS:EXIT:episode_limit:{self.completed}", flush=True); break
         finally:
             with self._write_lock: self._flush()
+            self._print_window_summary("Final rollout summary")
             server.server_close()
             self._dataset_file.close()
 
@@ -418,11 +491,11 @@ def main():
     p.add_argument("--max-steps-multiplier", type=float, default=2.0)
     p.add_argument("--idle-timeout",      type=int,   default=120)
     p.add_argument("--step-bonus",        type=float, default=0.0)
-    p.add_argument("--decode",            type=str,   default="greedy",
+    p.add_argument("--decode",            type=str,   default="sample",
                    choices=["greedy", "sample", "epsilon_greedy"])
     p.add_argument("--temperature",       type=float, default=1.0)
     p.add_argument("--top-k",             type=int,   default=0)
-    p.add_argument("--top-p",             type=float, default=1.0)
+    p.add_argument("--top-p",             type=float, default=0.95)
     p.add_argument("--epsilon",           type=float, default=0.02)
     p.add_argument("--no-decode-stats",   action="store_true")
     p.add_argument("--min-depth",         type=int,   default=1)

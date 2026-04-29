@@ -55,5 +55,7 @@
     "None": 53,
     "Error": 54,
     "action_history:": 55,
-    "%": 56
+    "%": 56,
+    "angleMode:": 57,
+    "rad": 58
 }

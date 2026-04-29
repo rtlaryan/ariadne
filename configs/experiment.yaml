@@ -1,12 +1,12 @@
-experiment_name: "benchmark"
+experiment_name: "benchmark_256_8_8"
 base_save_dir: "runs"
 overwrite: false
-reset_scheduler: false
+reset_scheduler: true
 
 # Model Architecture
 embed_dim: 256
-num_layers: 4
-num_heads: 4
+num_layers: 8
+num_heads: 8
 max_len: 196
 block_size: 4096
 use_packing: true
@@ -29,7 +29,7 @@ data_generation:
 
 # Phase 1: Pre-training
 pretrain:
-  enabled: false
+  enabled: true
   run_name: "pre_train"
   epochs: 20
   batch_size: 1024
@@ -41,7 +41,7 @@ pretrain:
 # Phase 2: DAgger Loop
 dagger:
   enabled: true
-  iterations: 50
+  iterations: 35
 
   generation:
     episodes_per_iter: 15000
@@ -55,49 +55,64 @@ dagger:
     idle_timeout: 120
     timeout_safety_multiplier: 3.0
     min_depth: 1
-    max_depth: [6, 6, 6, 7, 7, 7, 8]
+    max_depth: [6, 6, 6, 7, 7, 7]
 
   training:
     epochs: 20
     batch_size: 1024
-    lr: 1e-4
-    lr_decay: .98             # multiplicative decay applied across DAgger iterations
+    lr: 3e-4
+    lr_decay: .99             # multiplicative decay applied across DAgger iterations
     expert_multiplier: 0.25    # ratio of expert episodes per dagger episode
     decay_factor: 0.8          # probability of keeping data:  factor^age
 
 # Phase 3: Reinforcement Learning
 rl:
-  enabled: false
-  iterations: 5
+  enabled: true
+  iterations: 20
   # resume_from:               # optional: seed RL from a previous checkpoint
 
   rollout:
-    episodes_per_iter: 1000
-    workers: 8
-    remote_clients: true
-    max_steps_multiplier: 2.0
-    idle_timeout: 120
-    timeout_safety_multiplier: 3.0
-    step_bonus: 0.0
-    decode: "greedy"
-    temperature: 1.0
-    min_depth: 1
-    max_depth: 7
+    episodes_per_iter: 200      # total rollout episodes collected per PPO iteration
+    workers: 8                   # number of parallel RL rollout workers
+    remote_clients: true         # true = wait for external bridge clients, false = launch local clients
+    max_steps_multiplier: 2.0    # terminate an episode after oracle_plan_len * multiplier steps
+    idle_timeout: 120            # worker exits if no bridge requests arrive for this many seconds
+    timeout_safety_multiplier: 3.0  # orchestrator timeout cushion over observed rollout rate
+    step_bonus: 0.0             # reward for valid-prefix non-terminal actions; invalid steps get the opposite sign
+    decode: "sample"            # rollout policy: "greedy", "sample", or "epsilon_greedy"
+    temperature: 1.0            # sampling temperature; higher = more exploratory, lower = sharper
+    top_k: 0                    # sample only from top-k actions (0 disables top-k filtering)
+    top_p: 0.95                 # nucleus sampling cutoff; keep the smallest set of actions with cumulative prob <= top_p
+    epsilon: 0.02               # random-action rate used only by "epsilon_greedy"
+    min_depth: 1                # minimum oracle expression depth for rollout tasks
+    max_depth: 7                # maximum oracle expression depth for rollout tasks
 
   training:
     lr: 1e-5
     lr_decay: 0.995             # multiplicative decay applied across RL iterations (iter-level)
     lr_warmup_steps: 0          # linear warm-up steps within one RL iteration (0 = disabled)
     lr_min_ratio: 0.05          # cosine floor: final LR = lr * lr_min_ratio
-    gamma: 0.99
-    entropy_bonus: 0.001
-    entropy_decay: 0.995
-    kl_penalty: 0.2
-    kl_decay: 0.99
-    max_grad_norm: 0.5
-    baseline_alpha: 0.99
-    rl_epochs: 1
-    rl_batch_size: 64
-    success_only: true
-    supervised_weight: 0.0
-    min_success_rate: 0.0
+    gamma: 0.99                 # reward discount factor
+    gae_lambda: 0.95            # GAE smoothing; lower = lower variance, higher = less bias
+    ppo_epochs: 4               # number of passes over the same rollout batch
+    minibatch_size: 64          # PPO minibatch size over flattened transitions
+    clip_ratio: 0.2             # PPO ratio clipping threshold
+    value_loss_coef: 0.5        # critic loss weight in the total objective
+    entropy_coef: 0.001         # entropy bonus weight for exploration
+    target_kl: 0.02             # early-stop threshold if PPO updates move too far in one iteration
+    reference_kl_coef: 0.0      # optional penalty against the frozen seed/reference policy (0 disables it)
+    max_grad_norm: 0.5          # gradient clipping threshold
+    min_success_rate: 0.0       # skip PPO training if rollout success rate falls below this
+
+# Phase 4: Evaluation
+evaluation:
+  enabled: false
+  checkpoint: "latest"
+  suite: "standard"
+  workers: 8
+  base_port: 9000
+  remote_clients: true
+  headless: true
+  decode_mode: "greedy"
+  output_dir: "evaluation"
+  max_steps_multiplier: 2.0
